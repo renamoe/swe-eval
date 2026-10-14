@@ -1,0 +1,13 @@
+# Copy to qwen35-ssh.conf and fill in the actual connection information.
+# The real configuration is ignored by Git.
+Host seetacloud-qwen35
+    HostName your-ssh-host.example.com
+    Port 22
+    User root
+    IdentityFile ~/.ssh/id_ed25519_seetacloud_qwen35
+    IdentitiesOnly yes
+    ServerAliveInterval 30
+    ServerAliveCountMax 3
+    ExitOnForwardFailure yes
+    ConnectTimeout 15
+    ControlPath ~/.ssh/qwen35-%C.sock

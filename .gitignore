@@ -1,0 +1,50 @@
+# Credentials and machine-local configuration
+.env*
+!.env.example
+!.env.*.example
+secrets/
+credentials/
+.ssh/
+id_rsa*
+id_ed25519*
+*.pem
+*.key
+*.p12
+*.pfx
+remote*.txt
+scripts/qwen35-ssh.conf
+models/*.local.json
+configs/**/*.local.yaml
+configs/**/*.local.json
+
+# Python environments, caches and build output
+.venv/
+__pycache__/
+*.py[cod]
+.cache/
+.python/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+*.egg-info/
+build/
+dist/
+
+# Generated datasets, experiments and future runtime state
+/runs/
+/profiles/
+/.state/
+*.log
+
+# Web dependencies and local tools
+node_modules/
+.vite/
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo

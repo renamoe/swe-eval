@@ -1,0 +1,9 @@
+[project]
+name = "swe-eval"
+version = "0.1.0"
+description = "Local Qwen evaluation orchestration for SWE-bench and Terminal-Bench"
+requires-python = ">=3.11,<3.12"
+dependencies = []
+
+[tool.uv]
+package = false

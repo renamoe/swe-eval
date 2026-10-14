@@ -16,7 +16,6 @@ def register_secret(value):
 def redact(text):
     keys = {'EVAL_API_KEY', 'OPENAI_API_KEY', 'HF_TOKEN', 'HUGGING_FACE_HUB_TOKEN'}
     keys.update(key for key in os.environ if key.endswith('_API_KEY'))
-    keys.add(os.environ.get('EVAL_API_KEY_ENV', 'EVAL_API_KEY'))
     for key in keys:
         register_secret(os.environ.get(key, ''))
     for secret in sorted(_secrets, key=len, reverse=True):

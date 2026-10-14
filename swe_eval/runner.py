@@ -3,7 +3,7 @@ from pathlib import Path
 import re
 import time
 
-from .config import ROOT, digest
+from .config import ROOT, base_env, digest
 from .doctor import doctor
 from .io import execute, read_json, redact, scrub_tree, write_json
 from .results import row, summarize, swe_result, tb_results
@@ -17,16 +17,21 @@ def environment_python(benchmark):
     return str(project / '.venv' / 'bin' / 'python')
 
 
-def worker(benchmark, args, config, log, cwd=ROOT, timeout=300):
+# Manifest names supported until suite-defined sampling lands (M3).
+MANIFEST_SIZES = {'smoke': 1, 'small': 10}
+
+
+def worker(benchmark, args, log, cwd=ROOT, timeout=300):
+    # Helper workers never call the model; they get no credentials.
     result = execute([environment_python(benchmark), '-m', 'swe_eval.worker', *map(str, args)],
-                     cwd, log, env=config.child_env(), timeout=timeout)
+                     cwd, log, env=base_env(), timeout=timeout)
     if result['timed_out'] or result['returncode']:
         raise RuntimeError(f'Worker {args[0]} failed; see {log}')
     return result
 
 
 def validate_manifest(manifest, benchmark, profile):
-    n = 1 if profile == 'smoke' else 10
+    n = MANIFEST_SIZES[profile]
     tasks = manifest['tasks']
     ids = [t['id'] for t in tasks]
     if manifest['benchmark'] != benchmark or manifest['profile'] != profile or len(ids) != n:
@@ -38,7 +43,9 @@ def validate_manifest(manifest, benchmark, profile):
     return manifest
 
 
-def prepare(benchmark, profile, config):
+def prepare(benchmark, profile):
+    if profile not in MANIFEST_SIZES:
+        raise ValueError(f'Unsupported manifest {profile}; expected one of {", ".join(MANIFEST_SIZES)}')
     path = ROOT / 'profiles' / f'{benchmark}-{profile}.json'
     if not path.exists():
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -48,7 +55,7 @@ def prepare(benchmark, profile, config):
             with marker.open('x'):
                 temporary = path.with_suffix('.candidate.json')
                 try:
-                    worker(benchmark, ['prepare', benchmark, profile, temporary], config,
+                    worker(benchmark, ['prepare', benchmark, profile, temporary],
                            path.with_suffix('.prepare.log'), timeout=900)
                     validate_manifest(read_json(temporary), benchmark, profile)
                     temporary.replace(path)
@@ -64,8 +71,8 @@ def prepare(benchmark, profile, config):
 def tb_config(config, tasks, output, oracle):
     agent = {'name': 'oracle'} if oracle else {
         'name': 'terminus-2', 'model_name': 'openai/' + config.model,
-        'kwargs': {'api_base': config.api_base, 'max_turns': config.max_turns, 'parser_name': 'json',
-                   'temperature': config.temperature, 'interleaved_thinking': False,
+        'kwargs': {'api_base': config.base_url, 'max_turns': config.max_turns, 'parser_name': 'json',
+                   'temperature': config.sampling_params['temperature'], 'interleaved_thinking': False,
                    'store_all_messages': True, 'enable_summarize': False,
                    'record_terminal_session': config.record_terminal_session,
                    'model_info': {'max_input_tokens': config.context_length,
@@ -82,7 +89,7 @@ def run_swe(config, tasks, output, oracle):
     rows = []
     if not oracle:
         worker('swebench', ['swe-config', output / 'config.json', output / 'agent-config.json'],
-               config, output / 'config.log')
+               output / 'config.log')
     for task in tasks:
         task_id = task['id']
         print(f'SWE-bench: {task_id}', flush=True)
@@ -121,7 +128,7 @@ def run_swe(config, tasks, output, oracle):
                                  '--predictions_path', str(directory / 'predictions.json'),
                                  '--instance_ids', task_id, '--max_workers', '1',
                                  '--run_id', 'score', '--timeout', str(config.swe_score_timeout)],
-                                scoring, scoring / 'harness.log', config.child_env(), config.swe_score_timeout)
+                                scoring, scoring / 'harness.log', base_env(), config.swe_score_timeout)
         write_json(directory / 'score-process.json', score_process)
         result = swe_result(task_id, agent_dir, scoring, process, oracle)
         if score_process['returncode'] or score_process['timed_out']:
@@ -136,35 +143,36 @@ def run_swe(config, tasks, output, oracle):
     return rows
 
 
-def run(benchmark, profile, run_id, config, runs_dir=Path('runs'), oracle=False):
+def run(benchmark, run_id, config, runs_dir=Path('runs'), oracle=False):
+    if benchmark not in config.benchmarks:
+        raise ValueError(f'Suite {config.suite_config} does not include {benchmark}')
+    profile = config.manifests[benchmark]
     if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]*', run_id):
         raise ValueError('run-id must be a safe directory name')
     output = (runs_dir / run_id).resolve()
     output.mkdir(parents=True, exist_ok=False)
     start = time.monotonic()
     started_at = time.time()
-    expected = 1 if profile == 'smoke' else 10
+    expected = MANIFEST_SIZES.get(profile, 0)
     rows, fatal = [], None
-    write_json(output / 'config.json', {**config.snapshot()})
+    write_json(output / 'config.json', config.snapshot())
     write_json(output / 'run.json', {'benchmark': benchmark, 'profile': profile, 'run_id': run_id,
+                                   'model_config': config.model_config, 'suite_config': config.suite_config,
                                    'oracle': oracle, 'started_at_unix': time.time()})
     print(f'Artifacts: {output}', flush=True)
     try:
-        manifest = prepare(benchmark, profile, config)
+        manifest = prepare(benchmark, profile)
         tasks = manifest['tasks']
         write_json(output / 'manifest.json', manifest)
         rows = [row(t['id']) for t in tasks]
         write_json(output / 'results.json', rows)
-        worker(benchmark, ['metadata', benchmark, output / 'dependencies.json'], config, output / 'metadata.log')
+        worker(benchmark, ['metadata', benchmark, output / 'dependencies.json'], output / 'metadata.log')
         lock = ROOT / 'environments' / benchmark / 'uv.lock'
         (output / 'environment.uv.lock').write_bytes(lock.read_bytes())
         metadata = read_json(output / 'dependencies.json')
-        frozen = config.snapshot()
-        for key in ('model', 'model_path', 'checkpoint', 'api_base', 'model_instance', 'api_key_env'):
-            frozen.pop(key)
         write_json(output / 'comparison.json', {
             'benchmark': benchmark, 'tasks_sha256': manifest['tasks_sha256'],
-            'settings': frozen, 'oracle': oracle, 'concurrency': 1, 'attempts': 1,
+            'settings': config.comparison_settings(), 'oracle': oracle, 'concurrency': 1, 'attempts': 1,
             'versions': metadata['versions'], 'agent_sources_sha256': metadata['agent_sources_sha256'],
             'installed_distributions_sha256': digest(metadata['all_distributions']),
             'python': metadata['python'],
@@ -183,7 +191,7 @@ def run(benchmark, profile, run_id, config, runs_dir=Path('runs'), oracle=False)
             write_json(output / 'harbor-config.json', tb_config(config, tasks, output, oracle))
             process = execute([environment_python(benchmark), '-m', 'swe_eval.worker', 'tb-run',
                                str(output / 'harbor-config.json')], output, output / 'harbor.log',
-                              config.child_env(), timeout=None)  # Dataset-native phase timeouts.
+                              config.child_env(api=not oracle), timeout=None)  # Dataset-native phase timeouts.
             write_json(output / 'harbor-process.json', process)
             rows = tb_results(tasks, output / 'harbor')
             write_json(output / 'results.json', rows)

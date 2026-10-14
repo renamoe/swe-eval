@@ -1,0 +1,14 @@
+# Generic OpenAI-compatible endpoint. Copy to configs/models/<name>.local.toml and edit.
+model = "example-coder"
+checkpoint = "baseline"
+base_url = "https://api.example.com/v1"
+api_key_env = "MODEL_API_KEY"   # only this variable is read; missing value is an error
+server = "other"                # server metadata (model root, context, version) is not checked
+context_length = 131072
+reasoning = false               # set true for reasoning models; doctor then requires reasoning content
+
+[sampling]
+temperature = 0.6
+top_p = 0.95
+
+# [extra_body]                  # provider-specific request fields, e.g. reasoning_effort = "medium"

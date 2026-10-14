@@ -1,0 +1,13 @@
+# One task per benchmark; validates the full chain, not a score.
+benchmarks = ["swebench", "tbv2"]
+max_tokens = 8192
+max_turns = 20
+swe_agent_timeout = 900
+swe_score_timeout = 1800
+api_timeout = 180
+swe_scoring = "submitted-only"
+record_terminal_session = false
+
+[manifests]
+swebench = "smoke"
+tbv2 = "smoke"

@@ -7,11 +7,29 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from swe_eval.config import Config, digest, load_env
+from swe_eval.config import Config, digest
 from swe_eval.doctor import check_api
 from swe_eval.io import execute, read_json, scrub_tree, write_json
 from swe_eval.results import classify, compare, mini_usage, row, summarize, swe_result, tb_results
 from swe_eval.runner import run, tb_config, validate_manifest
+
+
+def make_config(model=None, suite=None):
+    model = {'model': 'qwen35-9b', 'base_url': 'http://localhost:8000/v1', 'context_length': 131072,
+             'server': 'vllm', 'checkpoint': 'baseline', 'model_path': '/model', 'vllm_version': 'test',
+             'chat_template': 'models/templates/qwen35-9b.jinja', 'reasoning': True, 'api_key_env': 'EVAL_TEST_KEY',
+             'sampling': {'temperature': 0.6, 'top_p': 0.95},
+             'extra_body': {'top_k': 20, 'chat_template_kwargs': {'enable_thinking': True}}, **(model or {})}
+    suite = {'benchmarks': ['swebench', 'tbv2'], 'manifests': {'swebench': 'smoke', 'tbv2': 'smoke'},
+             'max_tokens': 16384, 'max_turns': 100, 'swe_agent_timeout': 3600, 'swe_score_timeout': 1800,
+             'api_timeout': 180, **(suite or {})}
+    from swe_eval.config import check_model, check_suite
+    return Config.build('test-model', check_model(model), 'test-suite', check_suite(suite), {})
+
+
+HOSTED = {'model': 'example-coder', 'base_url': 'https://api.example.com/v1', 'server': 'other',
+          'api_key_env': 'MODEL_API_KEY', 'reasoning': False, 'model_path': '', 'vllm_version': '',
+          'extra_body': {}}
 
 
 class FrameworkTests(unittest.TestCase):
@@ -19,48 +37,18 @@ class FrameworkTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.root = Path(self.tmp.name)
-        self.config = Config(checkpoint='baseline', model_path='/model', vllm_version='test', chat_template='template')
+        self.config = make_config()
+        environment = patch.dict(os.environ, {'EVAL_TEST_KEY': 'test-key'})
+        environment.start()
+        self.addCleanup(environment.stop)
 
     def manifest(self, benchmark='swebench'):
         tasks = [{'id': 'a__a-1', 'record': {'instance_id': 'a__a-1', 'patch': 'gold', 'problem_statement': 'fix'}}]
         return {'benchmark': benchmark, 'profile': 'smoke', 'tasks': tasks, 'tasks_sha256': digest(tasks)}
 
-    def test_env_literal_and_precedence(self):
-        file = self.root / '.env'
-        file.write_text('EVAL_MODEL="$(touch bad)"\nEVAL_TOP_K=8\n')
-        with patch.dict(os.environ, {'EVAL_MODEL': 'existing'}, clear=True):
-            load_env(file)
-            self.assertEqual(Config.from_env().model, 'existing')
-            self.assertEqual(Config.from_env().top_k, 8)
-
-    def test_config_rejects_credentials_and_invalid_limits(self):
-        for env in [{'EVAL_API_BASE': 'https://user:secret@host/v1'}, {'EVAL_MAX_TOKENS': '131072'},
-                    {'EVAL_TOP_P': 'nan'}, {'EVAL_MAX_TURNS': '0'}]:
-            with patch.dict(os.environ, env, clear=True), self.assertRaises(ValueError):
-                Config.from_env()
-
-    def test_hosted_model_instance_and_environment_override(self):
-        with patch.dict(os.environ, {'MODEL_API_KEY': 'private-key', 'EVAL_MAX_TURNS': '2'}, clear=True):
-            config = Config.from_env('openai-compatible.example')
-            self.assertEqual(config.model, 'example-coder')
-            self.assertEqual(config.api_backend, 'openai-compatible')
-            self.assertFalse(config.thinking)
-            self.assertEqual(config.max_turns, 2)
-            self.assertEqual(config.child_env()['OPENAI_API_KEY'], 'private-key')
-            self.assertNotIn('private-key', json.dumps(config.snapshot()))
-            self.assertNotIn('extra_body', config.sampling())
-
-    def test_instance_rejects_inline_key_and_invalid_thinking(self):
-        instance = self.root / 'model.json'
-        write_json(instance, {'api_key': 'do-not-store'})
-        with patch.dict(os.environ, {}, clear=True), self.assertRaises(ValueError):
-            Config.from_env(str(instance))
-        with patch.dict(os.environ, {'EVAL_THINKING': 'maybe'}, clear=True), self.assertRaises(ValueError):
-            Config.from_env()
-
     def test_hosted_preflight_skips_vllm_metadata_but_checks_actions(self):
         with patch.dict(os.environ, {'MODEL_API_KEY': 'private-key'}, clear=True):
-            config = Config.from_env('openai-compatible.example')
+            config = make_config(HOSTED)
             calls = []
             def respond(config, endpoint, payload):
                 calls.append((endpoint, payload))
@@ -71,14 +59,14 @@ class FrameworkTests(unittest.TestCase):
             with patch('swe_eval.doctor.request', side_effect=respond):
                 result = check_api(config)
         self.assertEqual([c[0] for c in calls], ['/chat/completions', '/chat/completions'])
-        self.assertFalse(result['thinking_validated'])
+        self.assertFalse(result['reasoning_validated'])
         self.assertFalse(result['server_context_verified'])
         self.assertNotIn('chat_template_kwargs', calls[0][1])
         self.assertNotIn('top_k', calls[0][1])
 
     def test_hosted_preflight_missing_key_fails_without_request(self):
         with patch.dict(os.environ, {'MODEL_API_KEY': ''}, clear=True):
-            config = Config.from_env('openai-compatible.example')
+            config = make_config(HOSTED)
             with patch('swe_eval.doctor.request') as request, self.assertRaises(ValueError):
                 check_api(config)
             request.assert_not_called()
@@ -102,7 +90,7 @@ class FrameworkTests(unittest.TestCase):
                 body = {'choices': [{'finish_reason': 'stop', 'message': {'content': content, 'reasoning_content': 'private reasoning'}}],
                         'usage': {'prompt_tokens': 10, 'completion_tokens': 20}}
             return io.BytesIO(json.dumps(body).encode())
-        with patch.dict(os.environ, {'EVAL_API_KEY': 'secret'}), patch('swe_eval.doctor.urlopen', side_effect=respond):
+        with patch.dict(os.environ, {'EVAL_TEST_KEY': 'secret'}), patch('swe_eval.doctor.urlopen', side_effect=respond):
             result = check_api(self.config)
         self.assertEqual(len(result['turns']), 2)
         first, second = [json.loads(c.data) for c in calls if c.data]
@@ -286,24 +274,24 @@ class FrameworkTests(unittest.TestCase):
 
     def test_run_without_dependencies_records_incomplete(self):
         with patch('swe_eval.runner.prepare', side_effect=RuntimeError('not installed')):
-            folder, summary = run('swebench', 'smoke', 'missing', self.config, self.root)
+            folder, summary = run('swebench', 'missing', self.config, self.root)
         self.assertFalse(summary['complete'])
         self.assertEqual(summary['task_count'], 1)
         self.assertTrue((folder / 'error.json').exists())
         with self.assertRaises(FileExistsError):
-            run('swebench', 'smoke', 'missing', self.config, self.root)
+            run('swebench', 'missing', self.config, self.root)
 
     def test_preflight_api_error_preserved_in_final_summary(self):
         lock = self.root / 'environments' / 'swebench' / 'uv.lock'
         lock.parent.mkdir(parents=True)
         lock.write_text('locked')
-        def fake_worker(benchmark, args, config, log):
+        def fake_worker(benchmark, args, log):
             write_json(args[2], {'versions': {}, 'all_distributions': [], 'python': 'test',
                                  'agent_sources_sha256': 'source'})
         with patch('swe_eval.runner.ROOT', self.root), patch('swe_eval.runner.prepare', return_value=self.manifest()), \
                 patch('swe_eval.runner.worker', side_effect=fake_worker), \
                 patch('swe_eval.runner.doctor', return_value={'ok': False, 'checks': {'docker': {'ok': True}, 'api': {'ok': False}}}):
-            output, summary = run('swebench', 'smoke', 'api-error', self.config, self.root / 'runs')
+            output, summary = run('swebench', 'api-error', self.config, self.root / 'runs')
         self.assertFalse(summary['complete'])
         self.assertEqual(read_json(output / 'results.json')[0]['status'], 'api_error')
         self.assertEqual(summary['status_counts'], {'api_error': 1})

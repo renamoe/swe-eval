@@ -32,7 +32,7 @@ def metadata(benchmark, target):
 
 
 def prepare(benchmark, profile, target):
-    n = 1 if profile == 'smoke' else 10
+    n = {'smoke': 1, 'small': 10}[profile]
     if benchmark == 'swebench':
         from datasets import load_dataset
         from huggingface_hub import HfApi
@@ -64,7 +64,7 @@ def swe_config(config, target):
     upstream['agent'].update(step_limit=config.max_turns, cost_limit=0)
     upstream['model'] = {'model_name': 'openai/' + config.model,
                          'model_class': 'litellm', 'cost_tracking': 'ignore_errors',
-                         'model_kwargs': dict(api_base=config.api_base, timeout=config.api_timeout,
+                         'model_kwargs': dict(api_base=config.base_url, timeout=config.api_timeout,
                                               num_retries=0, **config.sampling())}
     write_json(target, upstream)  # JSON is also valid YAML, no credentials embedded.
 
@@ -129,7 +129,7 @@ def main():
     elif mode == 'prepare':
         prepare(*args)
     elif mode == 'swe-config':
-        swe_config(Config(**read_json(args[0])), args[1])
+        swe_config(Config.from_snapshot(read_json(args[0])), args[1])
     elif mode == 'swe-agent':
         swe_agent(*args)
     elif mode == 'tb-run':

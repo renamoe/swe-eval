@@ -1,0 +1,5 @@
+# Copy to configs/models/<name>.toml (or <name>.local.toml to keep it untracked) per checkpoint.
+extends = "qwen35-base"
+model = "Qwen3.5-9B-sft-2000"
+checkpoint = "/root/ckpt/sft/step-2000"
+model_path = "/root/ckpt/sft/step-2000"

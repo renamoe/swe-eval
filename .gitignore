@@ -14,6 +14,7 @@ id_ed25519*
 remote*.txt
 scripts/qwen35-ssh.conf
 models/*.local.json
+configs/**/*.local.toml
 configs/**/*.local.yaml
 configs/**/*.local.json
 

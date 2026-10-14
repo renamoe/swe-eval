@@ -1,0 +1,13 @@
+# First 10 tasks by ID (legacy small profile; replaced by small-v1 in M3).
+benchmarks = ["swebench", "tbv2"]
+max_tokens = 8192
+max_turns = 20
+swe_agent_timeout = 900
+swe_score_timeout = 1800
+api_timeout = 180
+swe_scoring = "submitted-only"
+record_terminal_session = false
+
+[manifests]
+swebench = "small"
+tbv2 = "small"

@@ -9,8 +9,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from swe_eval.config import Config, load_env
 
 load_env()
-config = Config.from_env('seetacloud-qwen35-9b')
-client = OpenAI(base_url=config.api_base, api_key=config.api_key(),
+config = Config.load('qwen35-base', 'smoke')
+client = OpenAI(base_url=config.base_url, api_key=config.api_key(),
                 timeout=config.api_timeout, max_retries=0)
 models = client.models.list()
 assert config.model in [model.id for model in models.data]

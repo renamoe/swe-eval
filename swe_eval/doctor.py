@@ -42,7 +42,7 @@ def docker_access_diagnostics():
 
 
 def request(config, endpoint, payload=None, server_root=False):
-    base = config.api_base.rstrip('/')
+    base = config.base_url.rstrip('/')
     if server_root and base.endswith('/v1'):
         base = base[:-3]
     url = base + endpoint
@@ -55,7 +55,8 @@ def request(config, endpoint, payload=None, server_root=False):
 
 
 def check_api(config):
-    if config.api_backend == 'vllm':
+    config.api_key()  # Fail before any request when the declared key variable is missing.
+    if config.server == 'vllm':
         models = request(config, '/models')['data']
         model = next((m for m in models if m['id'] == config.model), None)
         if model is None:
@@ -66,15 +67,13 @@ def check_api(config):
         if actual_context != config.context_length:
             raise ValueError(f'Context mismatch: client={config.context_length}, server={actual_context}')
         if not config.checkpoint or not config.model_path or not config.vllm_version or not config.chat_template:
-            raise ValueError('Set EVAL_CHECKPOINT, VLLM_MODEL_PATH, VLLM_VERSION, VLLM_CHAT_TEMPLATE_FILE')
+            raise ValueError('server=vllm requires checkpoint, model_path, vllm_version and chat_template in the model config')
         if model.get('root') and model['root'] != config.model_path:
-            raise ValueError('VLLM_MODEL_PATH differs from server /models root')
+            raise ValueError('model_path differs from server /models root')
         version = request(config, '/version', server_root=True).get('version')
         if version != config.vllm_version:
-            raise ValueError('VLLM_VERSION differs from server /version')
+            raise ValueError('vllm_version differs from server /version')
     else:
-        if config.api_key() == 'EMPTY':
-            raise ValueError(f'Set {config.api_key_env} in .env before calling the hosted model API')
         model, version = {'id': config.model}, None
     messages = [{'role': 'user', 'content': 'Compute 17 * 19. Return exactly one bash fenced code block containing echo and the numeric answer. Think before answering.'}]
     turns = []
@@ -89,8 +88,8 @@ def check_api(config):
         reasoning = message.get('reasoning_content') or message.get('reasoning')
         if not isinstance(content, str) or not content.strip():
             raise ValueError('Expected nonempty final content')
-        if config.thinking and (not isinstance(reasoning, str) or not reasoning.strip()):
-            raise ValueError('Expected separate nonempty reasoning and final content; check qwen3 parser')
+        if config.reasoning and (not isinstance(reasoning, str) or not reasoning.strip()):
+            raise ValueError('Expected separate nonempty reasoning and final content; check the server reasoning parser')
         if '<think>' in content or '</think>' in content or message.get('tool_calls'):
             raise ValueError('Final content contains reasoning tags or native tool calls')
         if choice.get('finish_reason') != 'stop':
@@ -115,10 +114,10 @@ def check_api(config):
                       '{"analysis":"brief explanation","plan":"echo the result","commands":[{"keystrokes":"echo 324\\n","duration":1}],"task_complete":false}. '
                       'The keystrokes value must be an echo shell command ending in a newline. duration must be a number. No markdown.'}]
     return {'model': model, 'vllm_version': version, 'turns': turns,
-            'api_backend': config.api_backend, 'thinking_validated': config.thinking,
-            'server_context_verified': config.api_backend == 'vllm',
+            'server': config.server, 'reasoning_validated': config.reasoning,
+            'server_context_verified': config.server == 'vllm',
             'deployment_metadata_source': 'operator supplied chat template; server version and model root checked when exposed'
-            if config.api_backend == 'vllm' else 'hosted API; actual checkpoint, template and server context unavailable; temporary chain test only'}
+            if config.server == 'vllm' else 'server metadata not checked; checkpoint, template and context are operator declared'}
 
 
 def doctor(config, api=True, docker=True):

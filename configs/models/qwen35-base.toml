@@ -1,0 +1,21 @@
+# Qwen3.5-9B baseline served by vLLM through the SSH tunnel (scripts/qwen35-tunnel.sh).
+# Checkpoints extend this file and change only model/checkpoint/model_path.
+model = "Qwen3.5-9B"
+checkpoint = "seetacloud-Qwen3.5-9B-baseline"   # operator declared, recorded but not verified
+base_url = "http://127.0.0.1:8000/v1"
+api_key_env = ""          # tunnel endpoint without auth; set a variable name once the server requires a key
+server = "vllm"           # doctor checks /v1/models root and context, and /version
+model_path = "/root/autodl-tmp/models/Qwen3.5-9B"
+vllm_version = "0.31.0"
+chat_template = "models/templates/qwen35-9b.jinja"   # fingerprint only; must match the server template
+context_length = 65536
+reasoning = true          # doctor requires separate reasoning content
+
+[sampling]
+temperature = 0.6
+top_p = 0.95
+presence_penalty = 1.5
+
+[extra_body]              # passed through verbatim; Qwen/vLLM specific
+top_k = 20
+chat_template_kwargs = { enable_thinking = true }

@@ -1,222 +1,208 @@
-# 多模型评测工作台改进规划
+# 后训练评测改进规划
 
-状态：待实施。日期：2026-10-14。
+状态：待实施。日期：2026-10-14。本文是实施依据，实施中可按实际情况修订。
 
-## 1. 目标与范围
+## 1. 目标
 
-将现有命令行编排改为本地 Web 评测工作台，支持 Qwen3.5、Omni-Coder 和其他后训练 checkpoint 的接入、运行、监控和逐题比较。
+服务于后训练迭代：每产出一个 checkpoint，用固定的评测套件跑 SWE-bench Verified 和 Terminal-Bench 2.0，看到进度，随时可停可续，结束后得到与 baseline 的逐题对比。
 
-第一版继续使用 mini-SWE-agent + SWE-bench 官方 harness，以及 Harbor Terminus-2 + Terminal-Bench verifier。保留隔离依赖环境、冻结任务清单和原始产物。模型、agent 和评分器分别配置；接入模型不要求更换 agent。
+核心使用流程：
 
-交付目标：用户能够在网页选择实验配置、检查模型连接、启动测试、查看实时阶段、停止并保留结果、恢复未完成任务、比较模型版本。CLI 使用同一套服务逻辑。
-
-本文只描述待实施能力，不表示已修改模型服务、上下文长度、采样参数或评测预算。
-
-建库清理时已删除历史测试产物。后续历史兼容与中断恢复验收使用脱敏模拟 fixture，不依赖旧 runs 目录。
-
-## 2. 已确认的问题
-
-| 问题 | 现有实现 | 改进方向 |
-|---|---|---|
-| 进度依赖人工翻日志 | `telemetry.py` 写逐轮事件；`io.execute` 在子进程结束后才复制临时日志 | 增加阶段事件、持续日志和统一进度投影 |
-| 没有统一展示 | `results.py` 输出 JSON/CSV；两种轨迹格式分别保存 | Web 统一索引，保留原生查看器入口 |
-| 模型配置偏向 Qwen | `config.py` 将 vLLM 与 Qwen thinking 参数绑定，兼容 API 禁止 thinking | 分离传输、能力参数和服务端验证 |
-| 切模型容易残留配置 | 全局 `.env` 的 `EVAL_*` 可覆盖实例，通用 key 优先于实例 key | 显式实验配置、来源追踪、凭证按连接选择 |
-| 停止需要人工收尾 | 缺少持久队列和统一取消接口；中断可能遗留 worker/container | 独立 supervisor 管理进程树、资源和取消状态 |
-| 预算耗尽时补丁丢失 | SWE 非 Submitted 轨迹保存为空提交 | 保存候选补丁，按明确评分策略处理 |
-| 没有上下文监控 | 汇总累计 token，最大单次输入需临时脚本计算 | 每次请求统计输入、输出、reasoning、耗时及窗口余量 |
-| small 不代表多仓库表现 | 按 ID 排序取前 10 题，可能集中于单一仓库 | 新增独立的固定种子、多仓库样本配置 |
-| 比较限制过于集中 | `comparison.json` 严格比较，包含模板与服务版本 | 区分同模型 checkpoint 回归和跨模型比较 |
-| 尚无完整集配置 | CLI 和校验逻辑只支持 smoke/small | 支持显式清单、固定样本数和完整 split |
-
-## 3. 总体设计
-
-```text
-浏览器 Web                    CLI
-    │                          │
-    └──────── 应用服务 ─────────┘
-                │
-       独立 supervisor / 持久队列
-                │
-       ┌────────┴─────────┐
-       SWE worker         Harbor worker
-       mini-SWE-agent     Terminus-2
-       官方 harness       verifier
-       └────────┬─────────┘
-          原始产物 / 标准事件
-                │
-          索引 / 汇总 / 对比
-
-模型连接配置 → LiteLLM → OpenAI-compatible API → vLLM 或其他服务
+```bash
+# 部署新 checkpoint 后
+python -m swe_eval submit --model qwen35-sft-step2000 --suite small-v1
+python -m swe_eval status            # 或打开本地网页
+python -m swe_eval report qwen35-baseline qwen35-sft-step2000 --suite small-v1
 ```
 
-技术选择：
+保持不变：mini-SWE-agent + SWE-bench 官方 harness、Harbor Terminus-2 + 任务 verifier、两套隔离依赖环境、冻结任务清单、原始轨迹和评分证据。不改 agent 提示词、动作协议和上游评分逻辑。
 
-- 后端使用 FastAPI；前端使用 React + TypeScript + Vite，构建后由后端提供静态文件。
-- Web 服务与 supervisor 分进程。关闭网页、重启 Web 服务不停止评测；单 GPU 默认全局单并发，跨 benchmark 共用队列。
-- SQLite 保存队列、执行控制状态和索引；`runs/` 保存原始事件、配置、补丁与评分证据。评分汇总可从产物重建，SQLite 不成为唯一评分证据。
-- 实时页面使用 SSE 推送，按事件序号断线续读；提供轮询回退，不依赖长连接才能正确更新任务状态。
-- 首版面向当前 Linux/WSL 单机，默认绑定 `127.0.0.1`。不增加登录系统、云托管或多用户调度。
-- 保持两套 benchmark 锁文件和解释器隔离；Web 依赖使用独立环境，不侵入 agent 环境。
+不做：登录/多用户、分布式调度、自动部署或切换 checkpoint、自动 fallback 模型、新 agent、W&B/MLflow 集成、React 前端工程。
 
-## 4. 配置与模型接入
+## 2. 要解决的问题
 
-### 4.1 配置拆分
-
-| 文件类别 | 内容 | 示例标识 |
+| 问题 | 现状 | 改进 |
 |---|---|---|
-| `configs/connections/*.yaml` | base URL、凭证环境变量、传输 provider、超时、服务资源组 | `seetacloud-gpu` |
-| `configs/models/*.yaml` | 远端 model ID、checkpoint/revision、模型族、上下文、模板标识、reasoning 参数和响应字段映射 | `qwen35-baseline`、`omni-coder-baseline` |
-| `configs/agents/*.yaml` | agent 版本、提示词、动作协议、摘要策略 | `mini-swe-default`、`terminus2-json` |
-| `configs/experiments/*.yaml` | 模型、agent、数据集清单、采样、回合/时间/输出预算、并发、评分策略 | `qwen35-swe-small-v2` |
+| 换 checkpoint 麻烦且易串配置 | 模型 JSON 混合端点、身份和预算；`.env` 的 `EVAL_*` 可隐式覆盖；`EVAL_API_KEY` 优先于实例 key | 模型与套件分离；`.env` 只放凭证；覆盖只能显式传参 |
+| 非 Qwen 模型受限 | 兼容 API 强制 `thinking=false`，Qwen 参数与 vLLM 绑定 | 模型配置自带 `extra_body` 与 reasoning 字段，thinking 与后端解耦 |
+| 看进度要翻日志 | `io.execute` 结束后才写日志；无统一状态 | 每次运行维护 `status.json`，日志实时写入 |
+| 停止要人工收尾，无法续跑 | 无队列和取消；中断可能遗留容器 | 单一后台 supervisor + 文件队列；停止/恢复 |
+| 预算耗尽补丁丢失 | 非 Submitted 一律空提交 | 保存工作区 diff，评分策略显式选择 |
+| 看不到上下文压力 | 只汇总累计 token | 逐请求记录输入/输出/reasoning token 和 finish reason |
+| small 样本偏 | 按 ID 取前 10，集中于少数仓库 | 固定种子的多仓库样本、显式清单、完整 split |
+| 对比只能两两且条件全等 | `comparison.json` 全字段相等才能比较 | 多 checkpoint 对比，列出条件差异 |
 
-Omni-Coder 的远端 model ID、确切仓库、模板和 thinking 能力在实际接入时核对，不从名称推断。checkpoint 使用明确目录/revision；仅填写自定义名称时标记为操作者声明，不能显示成独立验证。
+## 3. 配置
 
-配置优先级：默认值 < 被引用配置 < 实验配置 < 显式 CLI 覆盖。新入口的 `.env` 只提供凭证和运行环境，不隐式覆盖模型及预算。网页启动前展示最终配置和字段来源，冻结到实验目录；运行中的实验不跟随配置文件变化。
+主 CLI 继续无第三方依赖，配置使用 TOML（标准库 `tomllib`）。只分两类：模型和套件。agent 由 benchmark 决定，不单独配置。
 
-### 4.2 通用请求与预检
+```text
+configs/
+  models/qwen35-base.toml          # 端点、模型族、采样、模板、reasoning 参数
+  models/qwen35-sft-step2000.toml  # extends = "qwen35-base"，只改 model/checkpoint
+  suites/smoke.toml                # 每套 1 题，验证链路
+  suites/small-v1.toml             # 固定种子多仓库样本
+  suites/full.toml                 # 完整 split
+```
 
-继续复用两套 agent 已有的 LiteLLM 客户端，由统一配置生成器生成原生 agent 配置，不额外实现一套模型 SDK。
+模型文件（字段示意）：
 
-- `provider` 控制传输路由；`server_kind` 控制可选的 vLLM 元数据校验；thinking 独立配置。
-- 模型配置支持受约束的 `extra_body`、reasoning 字段映射和能力声明；Qwen 参数只发给相应配置，不强加给其他模型。
-- 凭证只从选中连接的环境变量读取；缺失时明确报错，不回退到其他供应商的 key。
-- 预检拆成连接/鉴权、模型 ID、能力与 reasoning、所选 agent 动作协议、可选服务元数据校验。只测试实验所需协议。
-- 区分已验证、操作者声明、未知三种元数据状态；第三方 API 不必提供 vLLM `/version` 才能运行。
-- 预检生成独立记录，用量与 benchmark agent 用量分开。纯配置检查不调用模型；真实 API 预检明确展示会发请求。
-- 如声明支持原生 tools，但当前 agent 使用文本动作，界面明确显示实际协议。首版不新增原生 tools agent。
+```toml
+extends = "qwen35-base"        # 可选，单层继承
+model = "Qwen3.5-9B-sft-2000"  # 远端 model ID
+checkpoint = "/root/ckpt/sft/step-2000"   # 操作者声明，记录但不当作已验证
+base_url = "http://127.0.0.1:8000/v1"
+api_key_env = "QWEN_API_KEY"   # 只读这个变量；缺失即报错，无回退
+server = "vllm"                # vllm 时额外校验 /v1/models 的 root 与上下文；other 跳过
+context_length = 65536
+chat_template = "models/templates/qwen35-9b.jinja"   # 可选，仅用于记录指纹
+[sampling]
+temperature = 0.6
+top_p = 0.95
+presence_penalty = 1.5
+[extra_body]                   # 原样透传，Qwen 专用参数只写在 Qwen 配置里
+top_k = 20
+chat_template_kwargs = { enable_thinking = true }
+```
 
-首版直接连接 API；LiteLLM Proxy 留作可选连接。评测不自动切换到备用模型，每次运行记录实际后端与模型版本。若同一 GPU 热切换 checkpoint，切换属于显式部署操作：运行前核对模型身份，队列按资源组串行，模型不匹配时阻止运行。
+套件文件定义任务清单、预算和评分策略：`benchmarks`、各 benchmark 的 manifest 名称、`max_tokens`、`max_turns`、`swe_agent_timeout`、`swe_score_timeout`、`api_timeout`、`swe_scoring = "submitted-only" | "final-workspace"`。
 
-## 5. 任务生命周期与结果语义
+规则：
 
-运行状态：`queued / running / stopping / stopped / completed / failed / interrupted`。
+- 优先级：模型 ← extends 基础模型；套件独立；只有 CLI `--set key=value` 能覆盖，覆盖项写入快照。`.env` 只用于凭证和 `HF_TOKEN` 等环境变量，不再读取 `EVAL_*`。
+- 校验 `max_tokens < context_length`，未知字段报错。
+- 提交时把解析后的模型与套件配置冻结到 `runs/<run-id>/config.json`，后续修改配置文件不影响已排队或运行中的任务。
+- 现有 `models/*.json` 手工迁移到新格式，`Config` 类改为从冻结快照构造，worker 接口基本不变。
 
-单题执行阶段：`pending / environment_setup / agent_running / collecting_artifacts / scoring / finished`。
+## 4. 运行模型
 
-单题独立保存：
+一次 `submit` 针对“模型 × 套件”，每个 benchmark 生成一个 run，`run-id` 默认为 `<model>__<suite>__<benchmark>__<时间戳>`。
 
-- 终止原因：正常提交、回合耗尽、时间耗尽、上下文超限、API 错误、环境错误、用户停止。
-- 提交情况：是否正式提交、是否存在候选补丁、补丁来源和生成时间。
-- 评分情况：未评分、通过、失败、评分错误，以及官方报告路径。
+### 4.1 队列与 supervisor
 
-不要把执行完成、成功解题、实验完整、轨迹完整混成一个状态。不完整实验展示“已评分 x / 计划 n，通过 y”，完整集成功率保持 null；可显示已评分部分的描述性统计，但不当作完整成绩。
+- `.state/queue/` 下每个排队 run 一个 JSON 文件；单 GPU 场景全局串行，按提交顺序执行。
+- `python -m swe_eval supervisor` 为唯一后台进程，用 `flock` 锁保证只有一个实例；`submit` 发现没有 supervisor 时自动后台启动。`submit --foreground` 在当前终端同步执行，便于调试。
+- 状态以 run 目录为准，`.state/` 只是队列和 PID 记录，删除后可从 `runs/` 重建。不引入 SQLite。
 
-### 5.1 停止、恢复和异常收尾
+### 4.2 逐题执行
 
-- 停止支持两种明确动作：立即停止；完成当前题后停止。默认立即停止。
-- 停止首先原子标记取消，禁止领取后续任务，再通知当前 worker。尽可能保存轨迹/候选补丁，在有界宽限期后终止剩余进程，清理本次运行所属容器。
-- “立即停止”不自动继续官方评分，也不启动后续 benchmark；可稍后显式选择仅评分已有产物。
-- 在各阶段处理取消，包括 Docker 镜像准备、模型请求和 verifier；记录进程启动时间及资源归属，避免按过期 PID 清理其他进程。
-- 收尾写出停止原因、未运行题、用量覆盖范围和可读汇总，即使 supervisor 被强杀，下次启动也可从事件/产物恢复状态。
-- supervisor 重启时先核对 worker 存活和身份；不重复启动仍在执行的任务。失联任务标记 interrupted，不伪装成模型失败。
-- 恢复默认只安排未完成题；中断题重新执行时创建新 attempt，不覆盖原轨迹，不宣称从原 agent 中间轮次恢复。完成题不重复调用模型。
-- 模型请求取消以客户端断开为基础；远端计算是否立即停止取决于服务端，界面不能仅凭本地进程退出声称远端用量已停止。
+将两个 benchmark 统一为逐题循环，每题结束立即写 `tasks/<id>/result.json`：
 
-### 5.2 预算耗尽时的补丁
+- SWE：沿用现有逐题流程。
+- Terminal-Bench：改为每题一个 Harbor job（并发本来就是 1），以便逐题停止、恢复和汇总。`tb_results` 改为读取单题 job。
 
-SWE 在正常结束、预算终止和用户停止时尽可能保存工作区 diff，保存过程失败也单独记录。gold patch 不进入 agent 及用户可导出的模型输入。
+run 级 `status.json` 持续更新：状态（`queued / running / stopping / stopped / completed / failed / interrupted`）、当前题与阶段（`setup / agent / scoring`）、阶段开始时间、已完成/已评分/通过数、worker PID 与启动时间、最后心跳。
 
-评分策略显式冻结：`submitted-only` 保持现有正式提交口径；`final-workspace` 允许对预算终止时的候选补丁评分，但保留预算终止标签。两种策略分别汇总，不混用为同一受控对比。诊断性补评分不回写历史官方主结果。
+### 4.3 停止与恢复
 
-Terminal-Bench 继续由任务 verifier 评分；不把 SWE 的补丁策略套用到终端任务。用户停止时优先停止执行，后续评分由显式操作决定。
+- `stop <run-id>`：立即停止。写入停止请求，supervisor 向当前 worker 进程组发送 SIGTERM，宽限期后 SIGKILL；按记录的容器 ID / compose project 清理容器；不开始后续题和后续 run。
+- `stop --after-current`：当前题完成（含评分）后停止。
+- 被停止的题保存已有轨迹和候选补丁，标记 `stopped`，不进入成绩分母之外的任何统计。
+- `resume <run-id>`：重新入队，只执行没有终态 `result.json` 的题；重跑的题旧产物移入 `attempts/<n>/`，不从 agent 中间轮次续跑。
+- supervisor 启动时检查 `status.json` 中 PID 与启动时间；进程已不存在的 running run 标记 `interrupted`，等待显式 `resume`。
+- 本地停止只能保证客户端断开，远端是否立即中止生成取决于服务端，不做额外承诺。
 
-## 6. 监控事件与指标
+### 4.4 结果语义
 
-在现有 `events.jsonl` 基础上新增版本化的 run/task/phase 事件，统一包含 `run_id / task_id / attempt_id / seq / timestamp / event_type`。
+逐题记录三项，互不混用：
 
-保留模型原始请求响应与原生轨迹；展示层归一化其索引和指标，不改写原始证据。SSE 不直接传递完整大日志，由详情接口分页读取。
+- 终止原因：`submitted / turn_limit / timeout / context_limit / output_truncated / api_error / env_error / stopped`。
+- 补丁：是否正式提交、是否有候选补丁（仅 SWE）。
+- 评分：`not_scored / passed / failed / scoring_error`。
 
-增加以下信息：
+run 汇总给出“计划 n、已评分 x、通过 y”。仅当所有题都已评分且无 API/环境错误时给出 `resolved_rate`，否则为 null，现有 `summarize` 口径保持。
 
-- 当前阶段及持续时间、任务完成数、队列状态、worker 心跳、最后事件时间。
-- 每次请求的 prompt/completion/reasoning token、finish reason、响应耗时；最大单次输入和输出、累计用量、缺失 usage 覆盖率。
-- 可用输入预算按 `context_length - 当前请求的 max_tokens` 展示，输入 token 占用和预计剩余空间分别标注。未返回请求只能显示估计值，不能伪装成服务端精确计数。
-- 上下文超限、单次输出截断、回合耗尽、墙钟超时分开计数；累计 token 不当作上下文长度。
-- 工具格式错误、工具执行失败、补丁应用失败、官方测试失败分开展示。
-- 可选读取 vLLM metrics/GPU 状态；没有服务端权限时正常显示未知，不阻塞评测。
+### 4.5 SWE 候选补丁
 
-日志从“结束后复制”改为持续写入经过脱敏的日志，处理跨读取块的敏感字符串；不得将 key 写入事件、SSE、浏览器配置或导出报告。
+- `swe_agent` 在 `finally` 中、容器清理前执行 `git diff` 保存 `candidate.patch`，失败单独记录原因。
+- `submitted-only`（默认，与现有口径一致）：只对正式提交评分。
+- `final-workspace`：预算耗尽时也对候选补丁评分，结果带 `scored_from=candidate` 标签。
+- 评分策略属于套件，两种策略的 run 不做受控对比。
+- `regrade <run-id> --policy final-workspace` 生成旁路结果目录，不改写原结果。
+- Terminal-Bench 不适用，继续由 verifier 判定。
 
-## 7. Web 页面与交互
+## 5. 监控指标
 
-| 页面 | 核心内容 | 主要动作 |
+在现有 `events.jsonl` 和 `metrics.py` 基础上补充，不改变已有指标口径（见 [metrics.md](metrics.md)）：
+
+- 逐请求：prompt / completion / reasoning token、finish reason、耗时。逐题汇总最大单次输入、最大单次输出、上下文占用峰值 `max_prompt_tokens / (context_length - max_tokens)`。
+- 终止原因分类按 4.4 细化，`context_limit` 与 `output_truncated`（finish_reason=length）分开计数。
+- 日志改为边运行边写入 run 目录，写入时脱敏；脱敏处理按行缓冲，避免 key 被读取块切断后漏过。
+- 不采集 GPU / vLLM metrics。
+
+## 6. 任务集
+
+| 套件 | SWE-bench Verified | Terminal-Bench 2.0 |
 |---|---|---|
-| 实验列表 | 模型/checkpoint、benchmark、预算、状态、计划/完成/评分数量、通过数、用量 | 筛选、打开、复制配置创建实验 |
-| 新建实验 | 选择连接/模型/agent/任务集，最终配置预览和来源、估算任务数 | 配置检查、API 预检、加入队列 |
-| 运行详情 | 进度、当前阶段、队列、逐题状态、上下文/用量与耗时 | 立即停止、当前题后停止、恢复未完成任务 |
-| 单题详情 | 时间线、reasoning/final、命令与输出、补丁 diff、官方失败测试和原始日志 | 搜索、折叠长输出、下载产物、仅评分已有产物 |
-| 实验比较 | 条件兼容性、逐题胜负变化、token/轮数/耗时变化、失败原因分布 | 选择多个版本、筛选回归题、导出报告 |
-| 模型配置 | 连接与模型版本、能力、凭证变量是否就绪、预检记录 | 编辑/新增配置，查看验证状态 |
+| `smoke` | 1 题，链路验证 | 1 题 |
+| `small-v1` | 12 题：12 个仓库各 1 题，固定 seed | 10 题，固定 seed 随机抽取 |
+| `full` | 完整 test split（500） | 完整数据集 |
 
-停止按钮使用明确的动作名称，不增加无条件重复确认。取消过程可见且可重复请求，不能显示成功后仍偷偷领取下一题。
+- `prepare` 支持三种来源：显式 ID 清单、`n + seed`（SWE 可按仓库分层）、完整 split。生成的 manifest 记录 seed、数据集 revision 和实际 ID，冻结在 `profiles/`。
+- 现有 `validate_manifest` 中“固定 1/10 题”和“ID 必须排序”的约束改为按 manifest 自身声明校验。
+- Terminal-Bench 若 registry 提供类别元数据再考虑分层，首版不做。
+- gold patch 仍只存在于 manifest，不进入 agent 输入、网页和导出报告。
 
-首版轻量图表仅包括每轮上下文趋势、用量/耗时和终止原因分布。保留 CSV/JSON，增加可独立打开的静态 HTML 报告；不将 Web 服务运行作为查看历史结果的必要条件。
+## 7. 对比与报告
 
-## 8. 比较、样本和历史兼容
+`report <model...> --suite <suite>` 按 benchmark 汇总同一套件下多个模型的最新完整 run（也可直接传 run 目录）：
 
-- 同模型 checkpoint 回归使用严格模式：相同任务、agent/提示词、预算、采样、摘要/补丁评分策略、可比的模型模板/运行环境；显示所有差异。
-- 跨模型比较固定任务、agent、工具协议、评分策略和预算政策。模型专属模板、tokenizer、thinking 参数可不同，但显式列出；不同 tokenizer 的 token 数不可直接视为等量计算成本，应同时比较时间和其他预算。
-- 设置不兼容时允许并排浏览，阻止输出伪装成受控实验的汇总胜负结论。未完成样本配对只展示已配对结果及覆盖数。
-- 预算 policy 明确区分相同配置和模型推荐配置；跨模型按推荐参数比较时不能声称仅改变了模型权重。
-- 旧 `models/*.json`、CLI 和历史 `runs/` 继续可读，通过适配器转换；缺字段显示未知。旧实验原文件不覆盖，补充索引/诊断记录写入旁路文件。
-- 保留原有 sorted-first-10 清单，新增 `small-stratified-v1`，固定 seed、数据版本及实际 task IDs。SWE 按仓库覆盖取样，Terminal-Bench 按可用类别元数据取样；元数据不足时明确标记，不能假称分层。
-- 新增显式任务清单、固定 n/seed 和完整 split 入口；完整集定义来自冻结的数据集版本，不根据本地执行成败缩减。
-- 展示层不读取 gold patch 作为 agent 建议；导出和预检输入不得泄漏测试解答。
+- 前提：任务清单哈希、benchmark、评分策略、agent 依赖指纹一致，否则拒绝。
+- 预算、采样、模板等其他差异不阻止对比，但在报告顶部逐项列出。同一模型族的 checkpoint 回归通常应完全一致，有差异时醒目标注。
+- 内容：每个模型的通过数/成功率/token/轮数/耗时/终止原因分布；逐题矩阵（每题各模型通过与否），首个模型作为 baseline 标出新增通过和回退。
+- 不完整 run 只展示已配对评分的题和覆盖数，不给成功率差值。
+- 输出 `report.json`、`report.csv` 和单文件 `report.html`（内联 CSS，离线可打开）。
+- 现有 `compare` 命令保留为两模型版本的 `report` 别名。
 
-## 9. 建议代码布局与接口
+## 8. 本地网页
 
-下列路径及命令均为规划中的新增能力，不表示当前已经存在。
+只做监控和浏览，所有写操作复用 CLI 同一套函数。不新增前端工程。
+
+- `python -m swe_eval serve`，标准库 `http.server`，默认绑定 `127.0.0.1:8765`，无鉴权（只监听本机；需要远程查看时用 SSH 端口转发）。
+- 单个静态 HTML + 原生 JS，每 3 秒轮询 JSON 接口；不使用 SSE。
+- 页面：
+  - 队列与 run 列表：模型、套件、benchmark、状态、进度、通过数。
+  - run 详情：逐题状态、当前阶段与耗时、token 与上下文峰值、停止/恢复按钮。
+  - 单题详情：模型消息与工具调用时间线（reasoning 折叠）、补丁 diff、评分失败测试、原始日志链接。
+  - 对比：选择套件与模型，展示第 7 节的报告。
+- 文件接口只允许读取 `runs/` 下登记的路径，拒绝路径穿越。网页进程退出不影响 supervisor。
+
+## 9. 代码布局
+
+在现有平铺模块上增量修改，不重组包结构：
 
 ```text
 swe_eval/
-  config.py                  # 旧配置兼容层
-  configuration/             # 分层配置、校验、解析来源与快照
-  jobs/                      # supervisor、队列、状态机、停止/恢复
-  backends/                  # SWE/Harbor 适配，复用现有 worker
-  events.py                  # 版本化事件和订阅
-  artifacts.py               # 产物索引、旧实验导入和读取
-  results.py / metrics.py    # 评分事实、汇总、比较
-web/
-  backend/                   # FastAPI 和 SSE
-  frontend/                  # React + TypeScript
-configs/                     # connections / models / agents / experiments
-environments/web/            # 独立 Web 依赖与锁文件
-runs/<run-id>/               # 保持实验产物目录
-.state/eval.sqlite           # 持久执行控制与可重建索引，忽略版本控制
+  config.py      # 改：TOML 模型/套件加载、extends、--set、冻结快照
+  runner.py      # 改：逐题循环（含 TB 单题 job）、status.json、取消检查点
+  io.py          # 改：实时日志写入、进程组与容器记录
+  worker.py      # 改：候选补丁、TB 单题、manifest 采样
+  telemetry.py   # 改：逐请求 usage / finish reason
+  results.py     # 改：结果三元语义、report 多模型对比
+  queue.py       # 新：文件队列、supervisor、stop/resume
+  report.py      # 新：report.json/csv/html
+  web.py         # 新：http.server 接口 + 内联页面
+configs/models/  configs/suites/
 ```
 
-CLI 拟增加 `submit / status / stop / resume / view / report / models / regrade`；保留旧 `doctor / prepare / run / verify-scorer / compare` 兼容入口。后台和前台运行共用任务生命周期，不分别实现取消和配置逻辑。
+CLI：`submit / status / stop / resume / regrade / report / serve / supervisor`，保留 `doctor / prepare / verify-scorer`。旧 `run` 改为 `submit --foreground` 的别名。
 
-REST 拟包含：实验创建/查询、逐题与日志查询、stop/resume/regrade、模型配置与预检、比较、SSE 事件订阅。旧产物导入默认只读；文件接口仅访问登记的产物目录。
+## 10. 实施阶段
 
-## 10. 分阶段实施与验收
-
-| 阶段 | 交付 | 必须通过的验收 |
+| 阶段 | 内容 | 验收 |
 |---|---|---|
-| M0：状态与产物契约 | 定义事件/结果 schema、历史导入器、模拟历史与中断 fixture | 旧 smoke 格式和模拟 small 可读取；7 已评分、1 中断、2 未运行、TB 未启动均准确显示；不修改原结果 |
-| M1：执行生命周期 | 持久队列、supervisor、停止/恢复、阶段日志、候选补丁保存 | 在环境准备/模型调用/评分阶段分别取消，无后续任务启动或遗留容器；部分结果可读；恢复不重跑完成题；重启不重复执行存活 worker |
-| M2：通用模型配置 | 配置拆分、兼容层、能力预检、最终配置预览 | thinking/非 thinking 两类兼容 API 均能配置；切模型不沿用错误 key/旧参数；两套 agent 接收同一实验语义；旧入口保持兼容 |
-| M3：Web 监控与详情 | 实验列表、新建、实时监控、单题轨迹/补丁/评分 | 不翻文件即可定位阶段和失败原因；SSE 重连不丢状态；关网页不影响任务；网页 stop 使用 M1 的实际取消路径 |
-| M4：比较与导出 | 多版本逐题比较、上下文指标、HTML/CSV 导出、分层 small 与 full 清单 | 正确区分严格回归/跨模型比较；不完整实验不伪造完整成功率；静态报告离线可读；样本清单冻结可复现 |
-| M5：真实接入验收 | Qwen baseline、一个其他模型或后训练 checkpoint 的受控小规模运行 | 每个端点预检及两套 agent smoke 通过；官方评分、用量和轨迹完整；停止/恢复至少真实验证一次；可生成版本比较报告 |
+| M1 配置 | TOML 模型/套件、extends、显式覆盖、凭证只读指定变量；thinking 与 server 解耦；迁移现有两份模型配置 | 单测：继承与覆盖、未知字段、缺 key 报错、非 vLLM thinking 模型生成正确的 `extra_body`；`doctor --no-api` 通过 |
+| M2 执行生命周期 | 逐题结果、TB 单题 job、`status.json`、实时日志、队列与 supervisor、stop/resume、SWE 候选补丁 | 用假 worker 测试：排队串行、两种停止、无遗留子进程、resume 跳过已完成题、supervisor 重启标记 interrupted；真实 smoke 一次停止与恢复 |
+| M3 任务集与指标 | `small-v1`/`full` manifest、逐请求 usage 与上下文峰值、终止原因细分 | manifest 可复现（同 seed 同 ID）；SWE small 覆盖 12 仓库；假事件流测试指标 |
+| M4 报告 | 多模型 `report`、HTML 导出、`regrade` | 构造的 fixture 上：兼容性拒绝/差异列出、不完整 run 不出成功率差值、HTML 离线可读 |
+| M5 网页 | `serve` 与四个页面 | 本地启动后可看到运行中进度、停止按钮实际生效、路径穿越被拒 |
+| M6 真实验收 | Qwen baseline 与一个后训练 checkpoint 跑 smoke，再按需 small-v1 | 两套 benchmark 评分、轨迹、用量完整，生成对比报告 |
 
-依赖顺序：M0 → M1 → M2 → M3 → M4 → M5。M0/M1 不依赖网页，可以先修复当前最影响结果可信度和操作便利性的问题。
+顺序 M1 → M2 → M3 → M4 → M5 → M6。M1–M4 已覆盖后训练评测的主要需求，网页可延后。另一个 checkpoint 未就绪时，M6 只做 baseline，不宣称多模型接入已验收。
 
-M5 采用尽量少的真实请求，先 smoke 再按需要扩至 small；不以完整 benchmark 作为 Web 功能的开发回归测试。其他模型 endpoint/checkpoint 尚未就绪时可先完成模拟兼容验证，但不能宣称实际模型接入已验收。
+## 11. 测试
 
-## 11. 测试与迁移策略
-
-保留现有测试，新增测试集中覆盖有实际风险的行为：
-
-- 配置覆盖与来源、不同模型参数隔离、凭证选择和跨块日志脱敏。
-- 持久状态恢复、幂等取消、领取任务与停止之间的竞态、进程/容器资源归属。
-- 分阶段取消和重启的集成测试；候选补丁与正式提交的区分、评分重算不改写历史。
-- 两类 agent 事件归一化、usage 缺失、上下文/输出/时间预算分别分类。
-- Web 的创建→监控→停止→查看部分结果，以及历史导入和逐题对比的浏览器流程测试。
-
-开发验证优先使用本地假 API 和轻量 worker；真实 Docker/模型测试只验证关键集成路径。网页构建、类型检查、核心回归和选定集成检查通过后再开始 M5。
-
-迁移先只读导入已有实验，再将新入口接入 supervisor，最后保留旧命令作为兼容包装。任何修改评分语义的版本都记录新的 schema/策略指纹，不回填旧实验为新口径结果。
-
-第一版不包含：完整 TUI、强制 LiteLLM Proxy、W&B/MLflow/Langfuse、分布式调度、自动训练/部署、自动跨模型 fallback、自动更换 agent、修改远端显存配置。需要这些能力时再根据已出现的实际需求追加。
+- 继续使用 `unittest`，保留现有测试。
+- 开发期用本地假 OpenAI-compatible 服务和假 worker，不依赖 GPU 和 Docker；Docker/真实模型只在 M2 和 M6 做少量集成验证。
+- 重点覆盖：配置隔离与凭证、日志跨行脱敏、停止与领取下一题的竞态、resume 幂等、候选补丁与正式提交区分、`regrade` 不改原结果、报告兼容性判定。
+- 修改评分或指标口径时提升 `schema_version`；旧 run（`schema_version=2`）的 `report` 读取兼容，缺失字段显示为空。

@@ -9,6 +9,7 @@ from .doctor import doctor
 from .io import redact, write_json
 from .report import report
 from .runner import prepare, regrade, run_suite
+from .web import serve
 
 
 def interrupt(signum, frame):
@@ -55,6 +56,10 @@ def main(argv=None):
     again.add_argument('run', type=Path, help='Run directory')
     again.add_argument('--policy', default='final-workspace', choices=['final-workspace'])
     again.add_argument('--run-id', help='Default <source run-id>__<policy>')
+    view = commands.add_parser('serve', help='Read-only local web view of runs and reports')
+    view.add_argument('--runs-dir', type=Path, default=Path('runs'))
+    view.add_argument('--host', default='127.0.0.1', help='No authentication: keep it local, use SSH forwarding')
+    view.add_argument('--port', type=int, default=8765)
     args = parser.parse_args(argv)
     try:
         ignored = load_env()
@@ -78,6 +83,18 @@ def main(argv=None):
                                                              'gained', 'regressed')} for m in b['models']]}
                               for b in result['benchmarks']], indent=2, ensure_ascii=False))
             return 0 if all(m['complete'] for b in result['benchmarks'] for m in b['models']) else 2
+        if args.command == 'serve':
+            if args.host not in ('127.0.0.1', 'localhost', '::1'):
+                print(f'Warning: {args.host} exposes unauthenticated run artifacts to the network', file=sys.stderr)
+            server = serve(args.runs_dir, args.host, args.port)
+            print(f'Serving {args.runs_dir.resolve()} at http://{args.host}:{args.port}/ (Ctrl-C to stop)', flush=True)
+            try:
+                server.serve_forever()
+            except KeyboardInterrupt:
+                pass
+            finally:
+                server.server_close()
+            return 0
         if args.command == 'regrade':
             signal.signal(signal.SIGTERM, interrupt)
             signal.signal(signal.SIGINT, signal.default_int_handler)

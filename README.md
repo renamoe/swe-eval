@@ -7,7 +7,7 @@
 | SWE-bench Verified | mini-SWE-agent，文本 bash 动作 | SWE-bench 官方 harness |
 | Terminal-Bench 2.0 | Harbor Terminus-2，文本 JSON 动作 | 任务自带 verifier |
 
-当前版本使用前台 CLI，一次评一个模型；多模型报告和 Web 浏览尚待实施，详见 [改进规划](docs/improvement-plan.md)。历史测试产物已清理，仓库不包含可引用的 benchmark 成绩。
+当前版本使用前台 CLI，一次评一个模型；用 `report` 对比多个模型，用 `serve` 在本地网页查看进度和结果。后续计划见 [改进规划](docs/improvement-plan.md)。历史测试产物已清理，仓库不包含可引用的 benchmark 成绩。
 
 ## 安装
 
@@ -164,7 +164,17 @@ uv run --locked python -m swe_eval regrade runs/<run-id> --policy final-workspac
 
 结果写入新的 run 目录 `runs/<run-id>__final-workspace/`，原 run 不改动；轨迹路径仍指向原 run。两种评分口径的 run 不能放进同一份报告。
 
-Web 浏览尚待实施，见 [规划文档](docs/improvement-plan.md)。
+## 本地网页
+
+```bash
+uv run --locked python -m swe_eval serve            # http://127.0.0.1:8765/
+```
+
+只读，不控制运行；另开终端跑 `run` 时每 3 秒刷新进度。页面：run 列表（状态、进度、通过数），run 详情（逐题状态、当前阶段与耗时、token、上下文峰值），单题详情（模型消息与工具调用时间线、reasoning 折叠、补丁、失败测试、原始文件），以及按套件选择模型生成上面的报告。
+
+- 没有鉴权，默认只监听本机，且只接受本机 Host 头。远程查看用 SSH 端口转发（`ssh -L 8765:127.0.0.1:8765 <host>`），不要改成 `--host 0.0.0.0`。
+- 只读取 `runs/` 下登记过的 run 目录内的文件，拒绝路径穿越和符号链接；manifest、任务记录和 oracle 预测（含 gold patch）不提供。
+- 进度在 run 进行中从 `results.json` 和事件流读取，完整指标在 run 结束时写入。没有 `summary.json` 且进程已退出的 run 显示为“进程已退出”。
 
 ## 开发与版本控制
 

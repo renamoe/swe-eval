@@ -1,4 +1,5 @@
 import hashlib
+import os
 from pathlib import Path
 import re
 import signal
@@ -284,7 +285,9 @@ def run(benchmark, run_id, config, runs_dir=Path('runs'), oracle=False):
     write_json(output / 'config.json', config.snapshot())
     write_json(output / 'run.json', {'benchmark': benchmark, 'manifest': spec['name'], 'run_id': run_id,
                                    'model_config': config.model_config, 'suite_config': config.suite_config,
-                                   'oracle': oracle, 'started_at_unix': time.time()})
+                                   'oracle': oracle, 'started_at_unix': time.time(),
+                                   # Lets the web view tell a live run from one that died without a summary.
+                                   'pid': os.getpid()})
     print(f'Artifacts: {output}', flush=True)
     try:
         manifest = prepare(benchmark, spec)
@@ -405,7 +408,7 @@ def regrade(source, policy='final-workspace', runs_dir=None, run_id=None):
     comparison['regrade_environment_lock_sha256'] = hashlib.sha256(lock.read_bytes()).hexdigest() \
         if lock.exists() else None
     write_json(output / 'comparison.json', comparison)
-    write_json(output / 'run.json', dict(info, run_id=run_id, started_at_unix=time.time(),
+    write_json(output / 'run.json', dict(info, run_id=run_id, started_at_unix=time.time(), pid=os.getpid(),
                                          regrade={'source': str(source), 'policy': policy}))
     timeout = snapshot['suite']['swe_score_timeout']
     scorer = SimpleNamespace(swe_score_timeout=timeout)

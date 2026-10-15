@@ -176,16 +176,20 @@ def csv_rows(report):
     return rows
 
 
-def report(refs, output, suite=None, benchmarks=('swebench', 'tbv2'), runs_dir=Path('runs'), single=False):
+def build(refs, suite=None, benchmarks=('swebench', 'tbv2'), runs_dir=Path('runs'), single=False):
     groups = collect(refs, suite, benchmarks, runs_dir)
     if not groups:
         raise ValueError('No runs to report')
     if single and len(groups) > 1:
         raise ValueError('Comparison requires runs of the same benchmark')
     sections = [section(runs) for _, runs in sorted(groups.items())]
-    result = {'schema_version': SCHEMA_VERSION, 'suite': suite,
-              'generated_at': time.strftime('%Y-%m-%d %H:%M:%S'),
-              'scope': 'paired subset regression; not a full benchmark score', 'benchmarks': sections}
+    return {'schema_version': SCHEMA_VERSION, 'suite': suite,
+            'generated_at': time.strftime('%Y-%m-%d %H:%M:%S'),
+            'scope': 'paired subset regression; not a full benchmark score', 'benchmarks': sections}
+
+
+def report(refs, output, suite=None, benchmarks=('swebench', 'tbv2'), runs_dir=Path('runs'), single=False):
+    result = build(refs, suite, benchmarks, runs_dir, single)
     output = Path(output)
     output.mkdir(parents=True, exist_ok=False)
     write_json(output / 'report.json', result)

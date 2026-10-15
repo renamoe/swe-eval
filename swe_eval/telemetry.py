@@ -133,11 +133,19 @@ def observe_harbor():
 
     @wraps(original_completion)
     async def acompletion(*args, **kwargs):
-        response = await original_completion(*args, **kwargs)
+        # One llm_raw per HTTP attempt: Harbor's native retries happen inside one LLM call.
         recorder = CURRENT.get()
+        start = time.time()
+        try:
+            response = await original_completion(*args, **kwargs)
+        except BaseException as exc:
+            if recorder:
+                recorder.emit('llm_raw', ok=False, seconds=round(time.time() - start, 3),
+                              exception_type=type(exc).__name__)
+            raise
         if recorder:
             try:
-                recorder.emit('llm_raw', **raw_usage(response))
+                recorder.emit('llm_raw', ok=True, seconds=round(time.time() - start, 3), **raw_usage(response))
             except Exception as exc:  # Observation must never change the agent's outcome.
                 recorder.emit('telemetry_error', detail=str(exc))
         return response

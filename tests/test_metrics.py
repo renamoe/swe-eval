@@ -128,7 +128,9 @@ class MetricsTests(unittest.TestCase):
         # Harbor: LLMResponse has no finish reason; the raw litellm record carries it.
         r.response_index = 3
         r.emit('llm_start', args=[])
-        r.emit('llm_raw', finish_reason='stop', usage={'prompt_tokens': 6000, 'completion_tokens': 10})
+        r.emit('llm_raw', ok=False, seconds=180.0, exception_type='Timeout')
+        r.emit('llm_raw', ok=True, seconds=2.0, finish_reason='stop',
+               usage={'prompt_tokens': 6000, 'completion_tokens': 10})
         r.emit('llm_response', response={'content': '', 'usage': {'prompt_tokens': 6000, 'completion_tokens': 10}})
         r.response_index = 4
         r.emit('llm_start', args=[])
@@ -145,6 +147,9 @@ class MetricsTests(unittest.TestCase):
         requests = read_json(self.output / result['requests_path'])
         self.assertEqual([q['finish_reason'] for q in requests], ['stop', 'length', 'stop', None])
         self.assertEqual(requests[3], dict(requests[3], ok=False, error='APIConnectionError', prompt_tokens=None))
+        self.assertEqual((requests[2]['attempts'], requests[2]['attempt_errors']), (2, ['Timeout']))
+        self.assertIsNone(requests[0]['attempts'])
+        self.assertEqual(result['llm_attempt_count'], 5)
         self.assertIsNotNone(requests[0]['seconds'])
         summary = summarize(self.output, [result], 1, 1)
         self.assertEqual(summary['termination_counts'], {'turn_limit': 1})

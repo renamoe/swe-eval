@@ -15,11 +15,13 @@
 | 逐请求用量 | `requests.json`, `max_completion_tokens`, `reasoning_tokens`, `length_finish_count`, `llm_seconds` | 每次模型请求的 prompt／completion／reasoning token、finish reason、耗时与错误类型。`length_finish_count` 统计 finish_reason=length（输出被 `max_tokens` 截断）的请求，与上下文超限分开。reasoning token 仅在服务端返回 `completion_tokens_details` 时可得，否则为 null。 |
 | 失败完整轨迹 | `failures.json`, `trajectory_paths`, `events_paths`, `scoring_paths` | 保留原生轨迹、逐次完整模型输入输出、原始动作解析结果、实际工具调用及输出、终端 pane、错误和评分路径；不裁剪或采样失败任务。 |
 
-mini-SWE-agent 的原始响应保存在 `llm_response` 事件中；Harbor 的 `LLMResponse` 不含 finish reason，观测层额外包装 `litellm.acompletion`，按 trial 写入 `llm_raw` 事件（只记 finish reason 与 usage）。
+mini-SWE-agent 的原始响应保存在 `llm_response` 事件中；Harbor 的 `LLMResponse` 不含 finish reason，观测层额外包装 `litellm.acompletion`，每次 HTTP 尝试写入一条 `llm_raw` 事件（成功记 finish reason 与 usage，失败记异常类型，均带耗时）。
+
+重试口径两边不同，保持各自原生策略：mini-SWE-agent 关闭模型重试（`MSWEA_MODEL_RETRY_STOP_AFTER_ATTEMPT=1`），一次调用即一次 HTTP 请求；Harbor Terminus-2 保留原生两层重试（`LiteLLM.call` 与 `_query_llm` 各最多 3 次），一次 agent 调用最坏 9 个 HTTP 请求，单次超时为 `api_timeout`。外层重试在 `requests.json` 中是独立记录，内层重试计入该记录的 `attempts` 与 `attempt_errors`；`llm_attempt_count` 为逐题 HTTP 尝试总数。网关不稳定时，TB 的 agent 墙钟预算会被等待与重试消耗。
 
 `*_tasks_observed` 说明每个汇总指标覆盖多少任务。没有观测时保留 null，不把缺失记录算成 0。`token_usage_complete` 标记逐题 token 用量是否覆盖全部观测到的模型调用；请求中断、API 缺 usage 时，已知 token 仍保存，但不能当作完整成本。
 
-工具调用计数表示发送给执行环境的请求，包括开始执行后报错的调用；不包含 agent setup、verifier 命令和纯 completion 标记。格式正确但 shell 命令失败，是执行／解题问题，不是格式错误。`llm_call_count` 是框架级调用次数，不表示隐藏的 HTTP 传输重试次数。
+工具调用计数表示发送给执行环境的请求，包括开始执行后报错的调用；不包含 agent setup、verifier 命令和纯 completion 标记。格式正确但 shell 命令失败，是执行／解题问题，不是格式错误。`llm_call_count` 是框架级调用次数；Harbor 的 HTTP 尝试次数见 `llm_attempt_count`。
 
 mini-SWE-agent 使用原生 DefaultAgent、模型、环境与解析器，通过观测包装在每条消息之后原子保存原生轨迹。Harbor 使用原生 Terminus-2，通过观测包装保存每次 LLM 调用、解析与终端请求；原提示词、动作协议、重试策略和预算不变。`events.jsonl` 每个事件立即写入；Harbor 结束时另存 `messages.json`，包括 reasoning（若 API 提供）。
 

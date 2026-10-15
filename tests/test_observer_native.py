@@ -69,11 +69,19 @@ class HarborNativeObserverTest(unittest.TestCase):
         class Session:
             async def send_keys(self, keys, *args, **kwargs):
                 return None
+        calls = []
         async def raw_completion(**kwargs):
+            calls.append(1)
+            if len(calls) == 1:
+                raise TimeoutError('first attempt')
             return {'choices': [{'finish_reason': 'length'}], 'usage': {'prompt_tokens': 10, 'completion_tokens': 5}}
         async def native_run(self, instruction, environment, context):
             import litellm
-            await litellm.acompletion(model='m', messages=[])  # Harbor's LiteLLM backend calls this.
+            try:  # Harbor's LiteLLM backend calls this, retrying natively on failure.
+                await litellm.acompletion(model='m', messages=[])
+            except TimeoutError:
+                pass
+            await litellm.acompletion(model='m', messages=[])
             bad = await self._llm.call(prompt='bad JSON')
             self._parser.parse_response(bad.content)
             good = await self._llm.call(prompt=json.dumps({'analysis':'echo','plan':'run',
@@ -102,7 +110,9 @@ class HarborNativeObserverTest(unittest.TestCase):
             self.assertEqual(result['output_tokens'],10)
             self.assertTrue((directory/'messages.json').exists())
             raw = [json.loads(l) for l in (directory/'events.jsonl').read_text().splitlines()]
-            self.assertEqual([e['finish_reason'] for e in raw if e['event'] == 'llm_raw'], ['length'])
+            self.assertEqual([(e['ok'], e.get('finish_reason'), e.get('exception_type'))
+                              for e in raw if e['event'] == 'llm_raw'],
+                             [(False, None, 'TimeoutError'), (True, 'length', None)])
 
 
 if __name__ == '__main__':

@@ -13,7 +13,8 @@ METRIC_DEFAULTS = {
     'unrecoverable_format_error_count': None, 'format_auto_correction_count': None,
     'timeout': None, 'timeout_stages': [], 'oom_observed': None,
     'termination': None, 'reasoning_tokens': None, 'max_prompt_tokens': None, 'max_completion_tokens': None,
-    'context_peak': None, 'length_finish_count': None, 'llm_seconds': None, 'requests_path': None,
+    'context_peak': None, 'length_finish_count': None, 'llm_seconds': None, 'llm_attempt_count': None,
+    'requests_path': None,
     'token_usage_complete': None, 'metrics_complete': False, 'trace_complete': False,
     'trajectory_paths': [], 'events_paths': [], 'scoring_paths': [], 'metrics_notes': [],
 }
@@ -46,15 +47,20 @@ def termination(result, observed):
 
 
 def request_records(events):
-    """One record per model request: usage, finish reason and latency."""
+    """One record per agent-level model call: usage, finish reason, latency and HTTP attempts."""
     starts = {e['response_index']: e['timestamp'] for e in events if e['event'] == 'llm_start'}
-    raw = {e['response_index']: e for e in events if e['event'] == 'llm_raw'}
+    raw = {}
+    for e in events:
+        if e['event'] == 'llm_raw':
+            raw.setdefault(e['response_index'], []).append(e)
     records = []
     for event in events:
         if event['event'] not in ('llm_response', 'llm_error'):
             continue
         index = event['response_index']
-        source = raw.get(index)
+        attempts = raw.get(index, [])
+        answered = [a for a in attempts if a.get('ok', True)]  # Pre-attempt records lack ok.
+        source = answered[-1] if answered else None
         if source is None and event['event'] == 'llm_response':
             response = event.get('response') or {}
             native = (response.get('extra') or {}).get('response') or {}  # mini-SWE-agent keeps the raw body.
@@ -69,7 +75,10 @@ def request_records(events):
             'prompt_tokens': usage.get('prompt_tokens'), 'completion_tokens': usage.get('completion_tokens'),
             'reasoning_tokens': details.get('reasoning_tokens'),
             'seconds': round(event['timestamp'] - start, 3) if start is not None else None,
-            'error': event.get('exception_type') if event['event'] == 'llm_error' else None})
+            'error': event.get('exception_type') if event['event'] == 'llm_error' else None,
+            # Harbor only; mini-SWE-agent runs with retries off, so one call is one attempt.
+            'attempts': len(attempts) if attempts else None,
+            'attempt_errors': [a.get('exception_type') for a in attempts if a.get('ok') is False]})
     return records
 
 
@@ -86,7 +95,8 @@ def request_metrics(result, records, budget):
                   max_completion_tokens=max(completions) if completions else None,
                   reasoning_tokens=sum(reasoning) if reasoning else None,
                   length_finish_count=sum(r['finish_reason'] == 'length' for r in records) if records else None,
-                  llm_seconds=round(sum(seconds), 3) if seconds else None)
+                  llm_seconds=round(sum(seconds), 3) if seconds else None,
+                  llm_attempt_count=sum(r['attempts'] or 1 for r in records) if records else None)
     # Share of the input budget (context_length - max_tokens) used by the largest prompt.
     if prompts and budget:
         result['context_peak'] = round(max(prompts) / budget, 4)

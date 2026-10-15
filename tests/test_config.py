@@ -16,8 +16,9 @@ max_turns = 10
 swe_agent_timeout = 600
 swe_score_timeout = 600
 api_timeout = 60
-[manifests]
-swebench = "smoke"
+[manifests.swebench]
+name = "smoke"
+ids = ["a__a-1"]
 '''
 BASE = '''model = "base-model"
 checkpoint = "base"
@@ -167,7 +168,7 @@ reasoning_effort = "medium"
 class RepositoryConfigTests(unittest.TestCase):
     def test_shipped_configs_load(self):
         for model in ('qwen35-base', 'qwen35-sft.example', 'openai-compatible.example'):
-            for suite in ('smoke', 'small'):
+            for suite in ('smoke', 'small-v1', 'full'):
                 with self.subTest(model=model, suite=suite):
                     config = Config.load(model, suite)
                     self.assertLess(config.max_tokens, config.context_length)

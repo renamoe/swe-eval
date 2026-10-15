@@ -5,7 +5,7 @@ from pathlib import Path
 import re
 from .config import digest
 from .io import read_json, redact, write_json
-from .metrics import METRIC_DEFAULTS, INFRA_TIMEOUT_STAGES, archive_index
+from .metrics import METRIC_DEFAULTS, INFRA_TIMEOUT_STAGES, TERMINATIONS, archive_index
 
 INFRA = {'api_error', 'environment_error', 'pending', 'stopped'}
 
@@ -154,7 +154,7 @@ def csv_file(path, rows, fields):
 def summarize(directory, rows, elapsed, expected_count, fatal=None):
     complete = len(rows) == expected_count and not fatal and all(r['status'] not in INFRA for r in rows)
     success = sum(r['resolved'] is True for r in rows)
-    summary = {'schema_version': 2, 'complete': bool(complete), 'scope': 'subset only; not a full benchmark score',
+    summary = {'schema_version': 3, 'complete': bool(complete), 'scope': 'subset only; not a full benchmark score',
                'success_count': success, 'task_count': expected_count, 'recorded_task_count': len(rows),
                'success_rate': success / expected_count if complete else None,
                'elapsed_seconds': round(elapsed, 3), 'fatal_error': fatal,
@@ -165,6 +165,18 @@ def summarize(directory, rows, elapsed, expected_count, fatal=None):
         known = [r[key] for r in rows if r[key] is not None]
         summary[key] = sum(known) if known else None
         summary[key + '_tasks_observed'] = len(known)
+    observed = [r['termination'] for r in rows if r.get('termination')]
+    summary['termination_counts'] = {t: observed.count(t) for t in TERMINATIONS if t in observed}
+    summary['termination_tasks_observed'] = len(observed)
+    for key in ('reasoning_tokens', 'length_finish_count'):
+        values = [r[key] for r in rows if r.get(key) is not None]
+        summary[key] = sum(values) if values else None
+        summary[key + '_tasks_observed'] = len(values)
+    for key in ('max_prompt_tokens', 'max_completion_tokens', 'context_peak'):
+        values = [r[key] for r in rows if r.get(key) is not None]
+        summary[key] = max(values) if values else None
+    peaks = [r['context_peak'] for r in rows if r.get('context_peak') is not None]
+    summary['avg_context_peak'] = round(sum(peaks) / len(peaks), 4) if peaks else None
     for key in ('agent_rounds', 'tool_rounds', 'tool_call_count'):
         values = [r[key] for r in rows if r.get(key) is not None]
         summary['avg_' + key] = sum(values) / len(values) if values else None

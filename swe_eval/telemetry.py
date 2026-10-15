@@ -1,4 +1,5 @@
 """Observational hooks only: native prompts, parsing, retries and actions are unchanged."""
+import contextvars
 from dataclasses import asdict, is_dataclass
 from functools import wraps
 import json
@@ -8,7 +9,7 @@ import time
 
 from .io import redact, write_json
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def plain(value):
@@ -112,15 +113,39 @@ def observe_mini(agent, directory, checkpoint):
     return recorder
 
 
+CURRENT = contextvars.ContextVar('recorder', default=None)
+
+
+def raw_usage(response):
+    """finish_reason and full usage from a raw chat completion; Harbor's LLMResponse drops both."""
+    data = plain(response)
+    choices = data.get('choices') or [{}]
+    return {'finish_reason': choices[0].get('finish_reason'), 'usage': data.get('usage')}
+
+
 def observe_harbor():
     """Install per-instance observers in the isolated Harbor worker process."""
+    import litellm
     from harbor.agents.terminus_2.terminus_2 import Terminus2
     from harbor.environments.docker.docker import _sanitize_docker_compose_project_name
     original_run = Terminus2.run
+    original_completion = litellm.acompletion
+
+    @wraps(original_completion)
+    async def acompletion(*args, **kwargs):
+        response = await original_completion(*args, **kwargs)
+        recorder = CURRENT.get()
+        if recorder:
+            try:
+                recorder.emit('llm_raw', **raw_usage(response))
+            except Exception as exc:  # Observation must never change the agent's outcome.
+                recorder.emit('telemetry_error', detail=str(exc))
+        return response
 
     @wraps(original_run)
     async def run(self, instruction, environment, context):
         recorder = Recorder(self.logs_dir)
+        token = CURRENT.set(recorder)
         recorder.emit('container_project', project=_sanitize_docker_compose_project_name(environment.session_id),
                       task_id=self.logs_dir.parent.name.rsplit('__', 1)[0])
         original_call = self._llm.call
@@ -182,5 +207,7 @@ def observe_harbor():
             self._llm.call = original_call
             self._parser.parse_response = original_parse
             self._session.send_keys = original_keys
+            CURRENT.reset(token)
 
     Terminus2.run = run
+    litellm.acompletion = acompletion

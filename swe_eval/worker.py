@@ -61,29 +61,31 @@ def metadata(benchmark, target):
                         'all_distributions': sorted((d.metadata['Name'], d.version) for d in importlib.metadata.distributions())})
 
 
-def prepare(benchmark, profile, target):
-    n = {'smoke': 1, 'small': 10}[profile]
+def prepare(benchmark, spec_path, target):
+    from .manifests import select
+    spec = read_json(spec_path)
     if benchmark == 'swebench':
         from datasets import load_dataset
         from huggingface_hub import HfApi
         revision = HfApi().dataset_info(SWE_DATASET, revision=os.getenv('EVAL_SWE_REVISION', 'main')).sha
-        records = sorted(load_dataset(SWE_DATASET, split='test', revision=revision), key=lambda r: r['instance_id'])[:n]
-        source = {'dataset': SWE_DATASET, 'split': 'test', 'revision': revision}
-        tasks = [{'id': row['instance_id'], 'record': dict(row)} for row in records]
+        records = {r['instance_id']: dict(r) for r in load_dataset(SWE_DATASET, split='test', revision=revision)}
+        ids = select(records, spec, {i: r['repo'] for i, r in records.items()})
+        source = {'dataset': SWE_DATASET, 'split': 'test', 'revision': revision, 'available': len(records)}
+        tasks = [{'id': i, 'record': records[i]} for i in ids]
     else:
         from harbor.models.job.config import DatasetConfig
         dataset = DatasetConfig(name='terminal-bench', version='2.0')
-        configs = asyncio.run(dataset.get_task_configs())
-        configs = sorted(configs, key=lambda c: Path(c.path).name)[:n]
+        configs = {Path(c.path).name: c for c in asyncio.run(dataset.get_task_configs())}
+        ids = select(configs, spec)
         tasks = []
-        for item in configs:
+        for task_id in ids:
+            item = configs[task_id]
             if not item.git_url or not item.git_commit_id or len(item.git_commit_id) != 40:
                 raise ValueError('Terminal-Bench registry must resolve tasks to immutable Git commits')
-            tasks.append({'id': Path(item.path).name, 'task_config': item.model_dump(mode='json')})
-        source = {'dataset': 'terminal-bench', 'version': '2.0'}
-    if len(tasks) != n or len({t['id'] for t in tasks}) != n:
-        raise ValueError(f'Expected exactly {n} unique tasks')
-    write_json(target, {'schema_version': 1, 'benchmark': benchmark, 'profile': profile,
+            tasks.append({'id': task_id, 'task_config': item.model_dump(mode='json')})
+        commits = sorted({t['task_config']['git_commit_id'] for t in tasks})
+        source = {'dataset': 'terminal-bench', 'version': '2.0', 'available': len(configs), 'git_commits': commits}
+    write_json(target, {'schema_version': 2, 'benchmark': benchmark, 'name': spec['name'], 'spec': spec,
                         'source': source, 'tasks': tasks, 'tasks_sha256': digest(tasks)})
 
 

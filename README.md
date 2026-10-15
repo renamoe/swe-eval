@@ -37,7 +37,7 @@ uv run --locked python -m swe_eval doctor --no-api
 | 目录 | 内容 |
 |---|---|
 | `configs/models/` | 端点、远端模型 ID、checkpoint、上下文、采样、`extra_body`、reasoning 校验、凭证变量名 |
-| `configs/suites/` | benchmark、任务清单、`max_tokens`、回合与超时预算、SWE 评分策略 |
+| `configs/suites/` | benchmark、任务清单规格、`max_tokens`、回合与超时预算、SWE 评分策略 |
 
 规则：
 
@@ -88,11 +88,11 @@ vLLM 服务端需启用适用的 reasoning parser；Qwen 使用 `--reasoning-par
 ```bash
 uv run --locked python -m swe_eval doctor --model qwen35-base --output runs/preflight/doctor.json
 
-# 依次运行套件中的全部 benchmark：smoke 每套 1 题，small 每套 10 题
+# 依次运行套件中的全部 benchmark
 uv run --locked python -m swe_eval run --model qwen35-base --suite smoke
 
 # 只跑一个 benchmark，可指定 run-id
-uv run --locked python -m swe_eval run swebench --model qwen35-base --suite small --run-id baseline-swe-small
+uv run --locked python -m swe_eval run swebench --model qwen35-base --suite small-v1 --run-id baseline-swe-small
 ```
 
 `run` 在前台执行，每个 benchmark 一个 run，默认 `run-id` 为 `<model>__<suite>__<benchmark>__<时间戳>`。终端每题输出一行结果和耗时；子进程日志（`agent.log`、`harness.log`、`harbor.log`）边运行边写入，可以 `tail -f`。当前并发为 1、每题 1 次尝试、Harbor 不重试 trial，自动上下文摘要关闭。预算由套件和显式 `--set` 决定；smoke 只验证执行链路。
@@ -101,14 +101,24 @@ uv run --locked python -m swe_eval run swebench --model qwen35-base --suite smal
 
 SWE 评分策略由套件的 `swe_scoring` 决定。默认 `submitted-only` 只对正式提交评分；`final-workspace` 在预算耗尽时对最终工作区 diff（`candidate.patch`）评分，结果带 `scored_from=candidate`，终止原因仍为 `budget_exhausted`。两种策略的 run 不能直接比较。
 
-首次运行自动准备任务，也可单独执行：
+### 任务集
+
+| 套件 | SWE-bench Verified | Terminal-Bench 2.0 |
+|---|---|---|
+| `smoke` | 1 题（显式 ID），链路验证 | 1 题 |
+| `small-v1` | 12 题，12 个仓库各 1 题，固定 seed | 10 题，固定 seed |
+| `full` | 完整 test split（500） | 完整数据集 |
+
+套件的 `[manifests.<benchmark>]` 用三种方式之一声明清单：`ids = [...]`；`sample = n` 加 `seed`（SWE 可加 `stratify = "repo"`，先保证每个仓库一题再轮转）；`all = true`。抽样按 `sha256(seed:id)` 排序，与 Python 版本无关，同 seed 得到同一组 ID。
+
+首次运行自动准备，也可单独执行：
 
 ```bash
-uv run --locked python -m swe_eval prepare swebench --profile small
-uv run --locked python -m swe_eval prepare tbv2 --profile small
+uv run --locked python -m swe_eval prepare --suite small-v1
+uv run --locked python -m swe_eval prepare swebench --suite full
 ```
 
-`smoke/small` 分别取按 ID 排序后的前 1/10 题，不是随机或分层样本。数据版本、任务内容和哈希保存在生成的 `profiles/`；后续实验复用同一清单。该目录包含 SWE gold patch，禁止提供给 agent。删除后重新准备会重新解析上游版本，因此正式对比应保留同一份清单。
+清单冻结在 `profiles/<benchmark>-<name>.json`，记录规格、数据集 revision（TB 为任务 Git commit）和实际 ID，后续实验复用。修改规格必须换新的 `name`，否则拒绝运行。删除后重新准备会重新解析上游版本，正式对比应保留同一份清单。该目录包含 SWE gold patch，禁止提供给 agent。
 
 仅验证评分器（不调用模型，仍需 `--model` 以记录配置）：
 
@@ -125,10 +135,10 @@ uv run --locked python -m swe_eval verify-scorer --model qwen35-base --suite smo
 | `config.json`、`run.json`、`manifest.json` | 冻结的模型与套件配置、覆盖项和任务 |
 | `dependencies.json`、`environment.uv.lock`、`comparison.json` | 依赖与比较条件 |
 | `doctor.json` | 模型和 Docker 预检 |
-| `results.json/csv`、`summary.json/csv` | 逐题结果及汇总 |
+| `results.json/csv`、`summary.json/csv` | 逐题结果（含终止原因、上下文峰值）及汇总 |
 | `failures.json`、`docker-oom-events.json`、`cleanup.json` | 失败轨迹索引、本地 OOM 观察和结束时清理的容器 |
-| `tasks/<id>/agent/`、`tasks/<id>/scoring/` | SWE 轨迹、`candidate.patch` 与官方评分 |
-| `harbor/job/` | TB 原生轨迹、verifier 和 reward |
+| `tasks/<id>/agent/`、`tasks/<id>/scoring/` | SWE 轨迹、`requests.json`（逐请求用量）、`candidate.patch` 与官方评分 |
+| `harbor/job/` | TB 原生轨迹、`requests.json`、verifier 和 reward |
 
 指标定义见 [metrics.md](docs/metrics.md)。缺失数据保留 `null`，不当作零；未完成实验不报告完整成功率，模型解题失败与 API/环境错误分开记录。
 

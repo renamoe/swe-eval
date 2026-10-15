@@ -8,6 +8,10 @@ api_timeout = 180
 swe_scoring = "submitted-only"
 record_terminal_session = false
 
-[manifests]
-swebench = "smoke"
-tbv2 = "smoke"
+[manifests.swebench]
+name = "smoke"
+ids = ["astropy__astropy-12907"]
+
+[manifests.tbv2]
+name = "smoke"
+ids = ["adaptive-rejection-sampler"]

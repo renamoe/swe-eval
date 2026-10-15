@@ -1,0 +1,21 @@
+# Fixed regression subset: SWE one task from each of the 12 repositories, TB 10 seeded tasks.
+# Changing a manifest spec needs a new manifest name; the frozen list lives in profiles/.
+benchmarks = ["swebench", "tbv2"]
+max_tokens = 8192
+max_turns = 50
+swe_agent_timeout = 1800
+swe_score_timeout = 1800
+api_timeout = 180
+swe_scoring = "submitted-only"
+record_terminal_session = false
+
+[manifests.swebench]
+name = "small-v1"
+sample = 12
+seed = 20261015
+stratify = "repo"
+
+[manifests.tbv2]
+name = "small-v1"
+sample = 10
+seed = 20261015

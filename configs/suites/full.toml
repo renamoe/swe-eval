@@ -1,0 +1,17 @@
+# Complete SWE-bench Verified test split (500) and Terminal-Bench 2.0. Long; run per benchmark.
+benchmarks = ["swebench", "tbv2"]
+max_tokens = 8192
+max_turns = 100
+swe_agent_timeout = 3600
+swe_score_timeout = 1800
+api_timeout = 180
+swe_scoring = "submitted-only"
+record_terminal_session = false
+
+[manifests.swebench]
+name = "full"
+all = true
+
+[manifests.tbv2]
+name = "full"
+all = true

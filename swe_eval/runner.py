@@ -10,6 +10,7 @@ from .config import ROOT, base_env, digest
 from .doctor import doctor
 from .io import execute, read_json, redact, scrub_tree, write_json
 from .results import candidate_result, row, summarize, swe_result, tb_results
+from .manifests import SAFE_ID, spec_size
 from .metrics import docker_oom_events, enrich, task_directory
 
 
@@ -18,10 +19,6 @@ def environment_python(benchmark):
     if not (project / 'uv.lock').exists() or not (project / '.venv' / 'bin' / 'python').exists():
         raise RuntimeError(f'{benchmark} environment is not locked/installed; run bash scripts/setup.sh lock, then bash scripts/setup.sh sync')
     return str(project / '.venv' / 'bin' / 'python')
-
-
-# Manifest names supported until suite-defined sampling lands (M3).
-MANIFEST_SIZES = {'smoke': 1, 'small': 10}
 
 
 RUN_LABEL = 'swe_eval.run'
@@ -113,23 +110,30 @@ def worker(benchmark, args, log, cwd=ROOT, timeout=300):
     return result
 
 
-def validate_manifest(manifest, benchmark, profile):
-    n = MANIFEST_SIZES[profile]
+def validate_manifest(manifest, benchmark, spec):
+    """Check a frozen manifest against the suite spec that requested it."""
+    if manifest.get('schema_version') != 2:
+        raise ValueError(f"Manifest {spec['name']} uses an old format; prepare it under a new manifest name")
+    if manifest['benchmark'] != benchmark or manifest['name'] != spec['name']:
+        raise ValueError('Manifest benchmark or name mismatch')
+    if manifest['spec'] != spec:
+        raise ValueError(f"profiles/{benchmark}-{spec['name']}.json was prepared from a different spec; "
+                         'give the changed spec a new manifest name')
     tasks = manifest['tasks']
     ids = [t['id'] for t in tasks]
-    if manifest['benchmark'] != benchmark or manifest['profile'] != profile or len(ids) != n:
-        raise ValueError('Manifest benchmark, profile or task count mismatch')
-    if ids != sorted(set(ids)) or any(not re.fullmatch(r'[A-Za-z0-9_.-]+', x) or x in ('.', '..') for x in ids):
+    size = spec_size(spec)
+    if not ids or (size is not None and len(ids) != size) or ('ids' in spec and set(ids) != set(spec['ids'])):
+        raise ValueError('Manifest task list does not match its spec')
+    if ids != sorted(set(ids)) or not all(SAFE_ID.fullmatch(x) and x not in ('.', '..') for x in ids):
         raise ValueError('Manifest IDs must be unique, sorted and safe path components')
     if manifest['tasks_sha256'] != digest(tasks):
         raise ValueError('Manifest content hash mismatch')
     return manifest
 
 
-def prepare(benchmark, profile):
-    if profile not in MANIFEST_SIZES:
-        raise ValueError(f'Unsupported manifest {profile}; expected one of {", ".join(MANIFEST_SIZES)}')
-    path = ROOT / 'profiles' / f'{benchmark}-{profile}.json'
+def prepare(benchmark, spec):
+    """Resolve a suite manifest spec once; later runs reuse the frozen file under profiles/."""
+    path = ROOT / 'profiles' / f"{benchmark}-{spec['name']}.json"
     if not path.exists():
         path.parent.mkdir(parents=True, exist_ok=True)
         # Use an exclusive marker to prevent competing preparation overwrites.
@@ -137,18 +141,21 @@ def prepare(benchmark, profile):
         try:
             with marker.open('x'):
                 temporary = path.with_suffix('.candidate.json')
+                request = path.with_suffix('.spec.json')
                 try:
-                    worker(benchmark, ['prepare', benchmark, profile, temporary],
-                           path.with_suffix('.prepare.log'), timeout=900)
-                    validate_manifest(read_json(temporary), benchmark, profile)
+                    write_json(request, spec)
+                    worker(benchmark, ['prepare', benchmark, request, temporary],
+                           path.with_suffix('.prepare.log'), timeout=1800)
+                    validate_manifest(read_json(temporary), benchmark, spec)
                     temporary.replace(path)
                 finally:
                     temporary.unlink(missing_ok=True)
+                    request.unlink(missing_ok=True)
         finally:
             # Only remove our own marker (FileExistsError doesn't authorize removing another's).
             if 'temporary' in locals():
                 marker.unlink(missing_ok=True)
-    return validate_manifest(read_json(path), benchmark, profile)
+    return validate_manifest(read_json(path), benchmark, spec)
 
 
 def tb_config(config, tasks, output, oracle):
@@ -264,23 +271,24 @@ def run_suite(config, runs_dir=Path('runs'), run_id=None, benchmarks=None, oracl
 def run(benchmark, run_id, config, runs_dir=Path('runs'), oracle=False):
     if benchmark not in config.benchmarks:
         raise ValueError(f'Suite {config.suite_config} does not include {benchmark}')
-    profile = config.manifests[benchmark]
+    spec = config.manifests[benchmark]
     if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]*', run_id):
         raise ValueError('run-id must be a safe directory name')
     output = (runs_dir / run_id).resolve()
     output.mkdir(parents=True, exist_ok=False)
     start = time.monotonic()
     started_at = time.time()
-    expected = MANIFEST_SIZES.get(profile, 0)
+    expected = spec_size(spec) or 0  # Full split: known once the manifest is prepared.
     rows, fatal, stopped = [], None, False
     write_json(output / 'config.json', config.snapshot())
-    write_json(output / 'run.json', {'benchmark': benchmark, 'profile': profile, 'run_id': run_id,
+    write_json(output / 'run.json', {'benchmark': benchmark, 'manifest': spec['name'], 'run_id': run_id,
                                    'model_config': config.model_config, 'suite_config': config.suite_config,
                                    'oracle': oracle, 'started_at_unix': time.time()})
     print(f'Artifacts: {output}', flush=True)
     try:
-        manifest = prepare(benchmark, profile)
+        manifest = prepare(benchmark, spec)
         tasks = manifest['tasks']
+        expected = len(tasks)
         write_json(output / 'manifest.json', manifest)
         rows = [row(t['id']) for t in tasks]
         write_json(output / 'results.json', rows)
@@ -349,7 +357,8 @@ def run(benchmark, run_id, config, runs_dir=Path('runs'), oracle=False):
             cleanup_containers(output, run_id)
             oom = docker_oom_events(output, started_at) if rows else None
             for result in rows:
-                enrich(result, task_directory(output, benchmark, result['task_id']), output, oom)
+                enrich(result, task_directory(output, benchmark, result['task_id']), output, oom,
+                       budget=config.context_length - config.max_tokens)
             scrub_tree(output)
             summary = summarize(output, rows, time.monotonic() - start, expected, fatal)
             summary['stopped'] = stopped

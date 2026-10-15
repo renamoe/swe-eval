@@ -3,7 +3,7 @@ import json
 from pathlib import Path
 import signal
 import sys
-from .config import Config, load_env
+from .config import Config, load_env, load_suite
 from .doctor import doctor
 from .io import redact, write_json
 from .results import compare
@@ -28,9 +28,10 @@ def main(argv=None):
     check.add_argument('--output', type=Path)
     check.add_argument('--no-api', action='store_true', help='Docker checks only; not full acceptance')
     config_arguments(check, model_required=False)
-    prep = commands.add_parser('prepare', help='Resolve, sort and freeze dataset tasks')
-    prep.add_argument('benchmark', choices=['swebench', 'tbv2'])
-    prep.add_argument('--profile', choices=['smoke', 'small'], default='smoke')
+    prep = commands.add_parser('prepare', help="Resolve and freeze a suite's task lists under profiles/")
+    prep.add_argument('benchmark', nargs='?', choices=['swebench', 'tbv2'],
+                      help='Only this benchmark (default: every benchmark in the suite)')
+    prep.add_argument('--suite', default='smoke', help='Suite config name (configs/suites) or TOML path')
     for name in ('run', 'verify-scorer'):
         command = commands.add_parser(name, help='Run the suite in the foreground; Ctrl-C stops and cleans up')
         command.add_argument('benchmark', nargs='?', choices=['swebench', 'tbv2'],
@@ -54,9 +55,16 @@ def main(argv=None):
             print(json.dumps(result, indent=2, ensure_ascii=False))
             return 0 if result['complete'] else 2
         if args.command == 'prepare':
-            manifest = prepare(args.benchmark, args.profile)
-            print(json.dumps({'benchmark': args.benchmark, 'tasks': [t['id'] for t in manifest['tasks']],
-                              'tasks_sha256': manifest['tasks_sha256']}, indent=2))
+            name, suite = load_suite(args.suite)
+            output = []
+            for benchmark in [args.benchmark] if args.benchmark else suite['benchmarks']:
+                if benchmark not in suite['manifests']:
+                    raise ValueError(f'Suite {name} does not include {benchmark}')
+                manifest = prepare(benchmark, suite['manifests'][benchmark])
+                output.append({'benchmark': benchmark, 'manifest': manifest['name'],
+                               'tasks': [t['id'] for t in manifest['tasks']],
+                               'tasks_sha256': manifest['tasks_sha256']})
+            print(json.dumps(output, indent=2))
             return 0
         if args.command == 'doctor':
             if not args.model and not args.no_api:

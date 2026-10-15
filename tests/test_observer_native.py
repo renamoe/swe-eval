@@ -69,7 +69,11 @@ class HarborNativeObserverTest(unittest.TestCase):
         class Session:
             async def send_keys(self, keys, *args, **kwargs):
                 return None
+        async def raw_completion(**kwargs):
+            return {'choices': [{'finish_reason': 'length'}], 'usage': {'prompt_tokens': 10, 'completion_tokens': 5}}
         async def native_run(self, instruction, environment, context):
+            import litellm
+            await litellm.acompletion(model='m', messages=[])  # Harbor's LiteLLM backend calls this.
             bad = await self._llm.call(prompt='bad JSON')
             self._parser.parse_response(bad.content)
             good = await self._llm.call(prompt=json.dumps({'analysis':'echo','plan':'run',
@@ -86,7 +90,8 @@ class HarborNativeObserverTest(unittest.TestCase):
             agent._parser = TerminusJSONPlainParser()
             agent._session = Session()
             agent._chat = SimpleNamespace(messages=[])
-            with patch.object(Terminus2,'run',native_run), patch('swe_eval.telemetry.subprocess.run',
+            import litellm
+            with patch.object(Terminus2,'run',native_run), patch.object(litellm, 'acompletion', raw_completion),                     patch('swe_eval.telemetry.subprocess.run',
                     return_value=subprocess.CompletedProcess([],0,stdout='',stderr='')):
                 observe_harbor()
                 asyncio.run(agent.run('test',SimpleNamespace(session_id='a__test__env'),None))
@@ -96,6 +101,8 @@ class HarborNativeObserverTest(unittest.TestCase):
             self.assertEqual(result['tool_format_error_count'],1)
             self.assertEqual(result['output_tokens'],10)
             self.assertTrue((directory/'messages.json').exists())
+            raw = [json.loads(l) for l in (directory/'events.jsonl').read_text().splitlines()]
+            self.assertEqual([e['finish_reason'] for e in raw if e['event'] == 'llm_raw'], ['length'])
 
 
 if __name__ == '__main__':

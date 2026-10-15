@@ -14,13 +14,16 @@ from swe_eval.results import classify, compare, mini_usage, row, summarize, swe_
 from swe_eval.runner import run, tb_config, validate_manifest
 
 
+SMOKE = {'name': 'smoke', 'ids': ['a__a-1']}
+
+
 def make_config(model=None, suite=None):
     model = {'model': 'qwen35-9b', 'base_url': 'http://localhost:8000/v1', 'context_length': 131072,
              'server': 'vllm', 'checkpoint': 'baseline', 'model_path': '/model', 'vllm_version': 'test',
              'chat_template': 'models/templates/qwen35-9b.jinja', 'reasoning': True, 'api_key_env': 'EVAL_TEST_KEY',
              'sampling': {'temperature': 0.6, 'top_p': 0.95},
              'extra_body': {'top_k': 20, 'chat_template_kwargs': {'enable_thinking': True}}, **(model or {})}
-    suite = {'benchmarks': ['swebench', 'tbv2'], 'manifests': {'swebench': 'smoke', 'tbv2': 'smoke'},
+    suite = {'benchmarks': ['swebench', 'tbv2'], 'manifests': {'swebench': SMOKE, 'tbv2': SMOKE},
              'max_tokens': 16384, 'max_turns': 100, 'swe_agent_timeout': 3600, 'swe_score_timeout': 1800,
              'api_timeout': 180, **(suite or {})}
     from swe_eval.config import check_model, check_suite
@@ -44,7 +47,8 @@ class FrameworkTests(unittest.TestCase):
 
     def manifest(self, benchmark='swebench'):
         tasks = [{'id': 'a__a-1', 'record': {'instance_id': 'a__a-1', 'patch': 'gold', 'problem_statement': 'fix'}}]
-        return {'benchmark': benchmark, 'profile': 'smoke', 'tasks': tasks, 'tasks_sha256': digest(tasks)}
+        return {'schema_version': 2, 'benchmark': benchmark, 'name': 'smoke', 'spec': SMOKE,
+                'tasks': tasks, 'tasks_sha256': digest(tasks)}
 
     def test_hosted_preflight_skips_vllm_metadata_but_checks_actions(self):
         with patch.dict(os.environ, {'MODEL_API_KEY': 'private-key'}, clear=True):
@@ -115,10 +119,12 @@ class FrameworkTests(unittest.TestCase):
 
     def test_manifest_integrity(self):
         manifest = self.manifest()
-        validate_manifest(manifest, 'swebench', 'smoke')
+        validate_manifest(manifest, 'swebench', SMOKE)
+        with self.assertRaisesRegex(ValueError, 'different spec'):
+            validate_manifest(manifest, 'swebench', dict(SMOKE, ids=['b__b-1']))
         manifest['tasks'][0]['record']['patch'] = 'changed'
         with self.assertRaises(ValueError):
-            validate_manifest(manifest, 'swebench', 'smoke')
+            validate_manifest(manifest, 'swebench', SMOKE)
 
     def test_subprocess_timeout_and_redaction(self):
         with patch.dict(os.environ, {'EVAL_API_KEY': 'do-not-record'}):

@@ -12,12 +12,84 @@ METRIC_DEFAULTS = {
     'action_parse_attempts': None, 'tool_format_error_count': None, 'tool_format_error_rate': None,
     'unrecoverable_format_error_count': None, 'format_auto_correction_count': None,
     'timeout': None, 'timeout_stages': [], 'oom_observed': None,
+    'termination': None, 'reasoning_tokens': None, 'max_prompt_tokens': None, 'max_completion_tokens': None,
+    'context_peak': None, 'length_finish_count': None, 'llm_seconds': None, 'requests_path': None,
     'token_usage_complete': None, 'metrics_complete': False, 'trace_complete': False,
     'trajectory_paths': [], 'events_paths': [], 'scoring_paths': [], 'metrics_notes': [],
 }
 TIMEOUT = re.compile(r'timeout|timed out|time limit', re.I)
 OOM = re.compile(r'\boomkilled\b|\bout[ -]of[ -]memory\b|\boom(?:error|kill)?\b', re.I)
 INFRA_TIMEOUT_STAGES = {'api', 'agent_setup', 'environment_setup', 'verifier', 'unknown'}
+TERMINATIONS = ('submitted', 'turn_limit', 'timeout', 'context_limit', 'output_truncated',
+                'api_error', 'env_error', 'stopped')
+# Agent-side causes, checked in order against the result detail (native exception names and our labels).
+CAUSES = [('timeout', ('agent wall clock timeout', 'agenttimeout')),
+          ('context_limit', ('contextwindow', 'contextlength')),
+          ('output_truncated', ('outputlength',)),
+          ('turn_limit', ('limitsexceeded', 'turn limit', 'max_turn', 'max turn', 'max episode'))]
+
+
+def termination(result, observed):
+    """How the agent run ended; separate from the score and from the INFRA status."""
+    if result['status'] == 'stopped':
+        return 'stopped'
+    detail = result.get('detail', '').lower()
+    for name, needles in CAUSES:
+        if any(n in detail for n in needles):
+            return name
+    if result['status'] == 'api_error':
+        return 'api_error'
+    if result['status'] in ('environment_error', 'pending'):
+        return 'env_error'
+    # Gold/oracle runs have no agent telemetry and no agent termination.
+    return 'submitted' if observed and result['status'] in ('success', 'task_failed') else None
+
+
+def request_records(events):
+    """One record per model request: usage, finish reason and latency."""
+    starts = {e['response_index']: e['timestamp'] for e in events if e['event'] == 'llm_start'}
+    raw = {e['response_index']: e for e in events if e['event'] == 'llm_raw'}
+    records = []
+    for event in events:
+        if event['event'] not in ('llm_response', 'llm_error'):
+            continue
+        index = event['response_index']
+        source = raw.get(index)
+        if source is None and event['event'] == 'llm_response':
+            response = event.get('response') or {}
+            native = (response.get('extra') or {}).get('response') or {}  # mini-SWE-agent keeps the raw body.
+            source = {'finish_reason': ((native.get('choices') or [{}])[0] or {}).get('finish_reason'),
+                      'usage': native.get('usage') or response.get('usage')}
+        usage = (source or {}).get('usage') or {}
+        details = usage.get('completion_tokens_details') or {}
+        start = starts.get(index)
+        records.append({
+            'index': index, 'ok': event['event'] == 'llm_response',
+            'finish_reason': (source or {}).get('finish_reason'),
+            'prompt_tokens': usage.get('prompt_tokens'), 'completion_tokens': usage.get('completion_tokens'),
+            'reasoning_tokens': details.get('reasoning_tokens'),
+            'seconds': round(event['timestamp'] - start, 3) if start is not None else None,
+            'error': event.get('exception_type') if event['event'] == 'llm_error' else None})
+    return records
+
+
+def known(values):
+    return [v for v in values if isinstance(v, (int, float)) and not isinstance(v, bool)]
+
+
+def request_metrics(result, records, budget):
+    prompts = known(r['prompt_tokens'] for r in records)
+    completions = known(r['completion_tokens'] for r in records)
+    reasoning = known(r['reasoning_tokens'] for r in records)
+    seconds = known(r['seconds'] for r in records)
+    result.update(max_prompt_tokens=max(prompts) if prompts else None,
+                  max_completion_tokens=max(completions) if completions else None,
+                  reasoning_tokens=sum(reasoning) if reasoning else None,
+                  length_finish_count=sum(r['finish_reason'] == 'length' for r in records) if records else None,
+                  llm_seconds=round(sum(seconds), 3) if seconds else None)
+    # Share of the input budget (context_length - max_tokens) used by the largest prompt.
+    if prompts and budget:
+        result['context_peak'] = round(max(prompts) / budget, 4)
 
 
 def docker_oom_events(output, started_at):
@@ -70,7 +142,7 @@ def task_directory(output, benchmark, task_id):
     return matches[0] if len(matches) == 1 else output / 'missing-trial' / task_id
 
 
-def enrich(result, directory, output, oom_events=None):
+def enrich(result, directory, output, oom_events=None, budget=None):
     defaults = {k: list(v) if isinstance(v, list) else v for k, v in METRIC_DEFAULTS.items()}
     result.update(defaults)
     trace_paths = sorted([*directory.rglob('*.traj.json'), *directory.rglob('trajectory.json'),
@@ -117,6 +189,11 @@ def enrich(result, directory, output, oom_events=None):
                 result[field] = max(result.get(field) or 0, sum(values))
         result['token_usage_complete'] = bool(responses) and len(responses) == len(starts) and all(
             isinstance(u.get('prompt_tokens'), int) and isinstance(u.get('completion_tokens'), int) for u in usages)
+        records = request_records(events)
+        path = event_paths[0].parent / 'requests.json'
+        write_json(path, records)
+        result['requests_path'] = str(path.relative_to(output))
+        request_metrics(result, records, budget)
         result['trace_complete'] = not partial and any(e['event'] == 'agent_end' for e in events)
         result['metrics_complete'] = result['trace_complete'] and result['token_usage_complete']
         if not result['trace_complete']:
@@ -168,6 +245,7 @@ def enrich(result, directory, output, oom_events=None):
         result['oom_observed'] = bool(oom)
     if oom:
         result.update(status='environment_error', detail=detail + '; observed OOM', resolved=None)
+    result['termination'] = termination(result, bool(events))
     result['metrics_complete'] = bool(result['metrics_complete'] and result['timeout'] is not None
                                       and result['oom_observed'] is not None)
     return result

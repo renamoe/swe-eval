@@ -115,5 +115,60 @@ class MetricsTests(unittest.TestCase):
         self.assertEqual(summary['tool_format_error_rate'], .2)
 
 
+    def test_per_request_usage_finish_reason_and_context_peak(self):
+        r = self.recorder
+        # mini-SWE-agent: the raw completion is nested under extra.response.
+        for index, (prompt, completion, finish) in enumerate([(1000, 50, 'stop'), (3000, 8192, 'length')], 1):
+            r.response_index = index
+            r.emit('llm_start', messages=[])
+            r.emit('llm_response', response={'content': '', 'extra': {'response': {
+                'choices': [{'finish_reason': finish}],
+                'usage': {'prompt_tokens': prompt, 'completion_tokens': completion,
+                          'completion_tokens_details': {'reasoning_tokens': completion // 2}}}}})
+        # Harbor: LLMResponse has no finish reason; the raw litellm record carries it.
+        r.response_index = 3
+        r.emit('llm_start', args=[])
+        r.emit('llm_raw', finish_reason='stop', usage={'prompt_tokens': 6000, 'completion_tokens': 10})
+        r.emit('llm_response', response={'content': '', 'usage': {'prompt_tokens': 6000, 'completion_tokens': 10}})
+        r.response_index = 4
+        r.emit('llm_start', args=[])
+        r.emit('llm_error', exception_type='APIConnectionError', detail='reset')
+        r.emit('agent_end')
+        result = enrich(row('a', 'budget_exhausted', 'Agent exit: LimitsExceeded'), self.task, self.output,
+                        budget=8000)
+        self.assertEqual(result['max_prompt_tokens'], 6000)
+        self.assertEqual(result['max_completion_tokens'], 8192)
+        self.assertEqual(result['reasoning_tokens'], 25 + 4096)
+        self.assertEqual(result['length_finish_count'], 1)
+        self.assertEqual(result['context_peak'], 0.75)
+        self.assertEqual(result['termination'], 'turn_limit')
+        requests = read_json(self.output / result['requests_path'])
+        self.assertEqual([q['finish_reason'] for q in requests], ['stop', 'length', 'stop', None])
+        self.assertEqual(requests[3], dict(requests[3], ok=False, error='APIConnectionError', prompt_tokens=None))
+        self.assertIsNotNone(requests[0]['seconds'])
+        summary = summarize(self.output, [result], 1, 1)
+        self.assertEqual(summary['termination_counts'], {'turn_limit': 1})
+        self.assertEqual(summary['context_peak'], 0.75)
+        self.assertEqual(summary['length_finish_count'], 1)
+
+    def test_termination_categories(self):
+        cases = [(row('a', 'success'), 'submitted'), (row('a', 'task_failed'), 'submitted'),
+                 (row('a', 'budget_exhausted', 'Agent wall clock timeout'), 'timeout'),
+                 (row('a', 'budget_exhausted', 'AgentTimeoutError: 900 seconds'), 'timeout'),
+                 (row('a', 'budget_exhausted', 'ContextLengthExceededError: too long'), 'context_limit'),
+                 (row('a', 'budget_exhausted', 'OutputLengthExceededError: max_tokens'), 'output_truncated'),
+                 (row('a', 'budget_exhausted', 'Harbor reached configured turn limit'), 'turn_limit'),
+                 (row('a', 'api_error', 'APITimeoutError: request timed out'), 'api_error'),
+                 (row('a', 'environment_error', 'Missing Harbor trial result'), 'env_error'),
+                 (row('a', 'stopped', 'Stopped by user'), 'stopped')]
+        self.response(1)
+        self.recorder.emit('agent_end')
+        for result, expected in cases:
+            with self.subTest(detail=result['detail'], status=result['status']):
+                self.assertEqual(enrich(result, self.task, self.output)['termination'], expected)
+        # No telemetry (gold oracle): no agent termination to report.
+        self.assertIsNone(enrich(row('b', 'success'), self.output / 'absent', self.output)['termination'])
+
+
 if __name__ == '__main__':
     unittest.main()

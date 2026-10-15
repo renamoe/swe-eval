@@ -10,10 +10,11 @@ import sys
 import tomllib
 from urllib.parse import urlsplit
 
+from .manifests import check_spec
+
 ROOT = Path(__file__).resolve().parent.parent
 CONFIGS = ROOT / 'configs'
 BENCHMARKS = ('swebench', 'tbv2')
-# Kept until manifest preparation moves into suites (M3).
 ENV_PASSTHROUGH = {'EVAL_SWE_REVISION'}
 LEGACY_ENV = {'VLLM_MODEL_PATH', 'VLLM_VERSION', 'VLLM_CHAT_TEMPLATE_FILE'}
 
@@ -171,10 +172,9 @@ def check_suite(data):
     if not suite['benchmarks'] or any(b not in BENCHMARKS for b in suite['benchmarks']) \
             or len(set(suite['benchmarks'])) != len(suite['benchmarks']):
         raise ValueError(f'Suite benchmarks must be a non-empty unique subset of {", ".join(BENCHMARKS)}')
-    if set(suite['manifests']) != set(suite['benchmarks']) or \
-            not all(isinstance(v, str) and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]*', v)
-                    for v in suite['manifests'].values()):
-        raise ValueError('Suite manifests must name one manifest per benchmark')
+    if set(suite['manifests']) != set(suite['benchmarks']):
+        raise ValueError('Suite manifests must define one manifest per benchmark')
+    suite['manifests'] = {b: check_spec(b, spec) for b, spec in suite['manifests'].items()}
     for name in ('max_tokens', 'max_turns', 'swe_agent_timeout', 'swe_score_timeout', 'api_timeout'):
         if suite[name] <= 0:
             raise ValueError(f'{name} must be positive')

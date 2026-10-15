@@ -37,6 +37,8 @@ def alive(pid):
         return False
 
 
+SMALL = {'name': 'small', 'ids': ['t0', 't1', 't2']}
+
 class InterruptTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -86,7 +88,8 @@ class InterruptTests(unittest.TestCase):
     def manifest(self):
         tasks = [{'id': f't{i}', 'record': {'instance_id': f't{i}', 'patch': 'gold', 'problem_statement': 'x'}}
                  for i in range(3)]
-        return {'benchmark': 'swebench', 'profile': 'small', 'tasks': tasks, 'tasks_sha256': digest(tasks)}
+        return {'schema_version': 2, 'benchmark': 'swebench', 'name': 'small', 'spec': SMALL,
+                'tasks': tasks, 'tasks_sha256': digest(tasks)}
 
     def test_interrupted_run_marks_stopped_cleans_up_and_summarizes(self):
         lock = self.root / 'environments' / 'swebench' / 'uv.lock'
@@ -109,7 +112,7 @@ class InterruptTests(unittest.TestCase):
             return {'elapsed_seconds': 1, 'returncode': 0, 'timed_out': False}
 
         self.interrupt_after(started, delay=0.1)
-        config = make_config(suite={'manifests': {'swebench': 'small', 'tbv2': 'small'}})
+        config = make_config(suite={'manifests': {'swebench': SMALL, 'tbv2': SMALL}})
         with patch.dict(os.environ, {'EVAL_TEST_KEY': 'interrupt-run-test-key'}), patch('swe_eval.runner.ROOT', self.root), patch('swe_eval.runner.prepare', return_value=self.manifest()), \
                 patch('swe_eval.runner.worker', side_effect=fake_worker), \
                 patch('swe_eval.runner.doctor', return_value={'ok': True, 'checks': {}}), \

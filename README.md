@@ -142,15 +142,29 @@ uv run --locked python -m swe_eval verify-scorer --model qwen35-base --suite smo
 
 指标定义见 [metrics.md](docs/metrics.md)。缺失数据保留 `null`，不当作零；未完成实验不报告完整成功率，模型解题失败与 API/环境错误分开记录。
 
-选择另一个 checkpoint，用相同任务和设置生成新实验后比较：
+用同一套件跑完多个 checkpoint 后生成报告，第一个模型作为 baseline：
 
 ```bash
-uv run --locked python -m swe_eval compare runs/baseline-swe-small runs/checkpoint-swe-small
+uv run --locked python -m swe_eval report qwen35-base qwen35-sft-step2000 --suite small-v1
+uv run --locked python -m swe_eval report runs/<run-a> runs/<run-b>   # 也可直接传 run 目录
 ```
 
-比较核对任务、agent、提示词、环境、模板、采样和预算。不同评测条件会被拒绝，不能直接把不同预算的结果当作受控模型比较。
+模型名按 benchmark 取该套件下最新的完整 run（没有完整 run 时取最新一次）。输出在 `runs/reports/<时间>/`：`report.json`、逐题 `report.csv` 和单文件 `report.html`（内联 CSS，离线可打开，不含 gold patch）。
 
-多模型报告与 Web 浏览尚待实施，见 [规划文档](docs/improvement-plan.md)。
+- 任务清单哈希、benchmark、SWE 评分策略、agent 源码指纹不一致时拒绝生成。
+- 预算、采样、模板、依赖等其他差异不阻止报告，但逐项列在报告顶部，表示不是受控对比。
+- 逐题矩阵标出相对 baseline 的新增通过（↑）和回退（↓）。不完整 run 只比较双方都已评分的题，不给成功率差值。
+- `compare <baseline> <checkpoint>` 保留为两个 run 的 `report`。
+
+对已完成的 SWE run 改用 `final-workspace` 口径评分（预算耗尽时对 `candidate.patch` 评分）：
+
+```bash
+uv run --locked python -m swe_eval regrade runs/<run-id> --policy final-workspace
+```
+
+结果写入新的 run 目录 `runs/<run-id>__final-workspace/`，原 run 不改动；轨迹路径仍指向原 run。两种评分口径的 run 不能放进同一份报告。
+
+Web 浏览尚待实施，见 [规划文档](docs/improvement-plan.md)。
 
 ## 开发与版本控制
 

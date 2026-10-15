@@ -5,6 +5,7 @@ import signal
 import subprocess
 import threading
 import time
+from types import SimpleNamespace
 
 from .config import ROOT, base_env, digest
 from .doctor import doctor
@@ -372,3 +373,90 @@ def interrupted(result):
     # Harbor trials in flight or not started when the user stopped (SWE in-flight rows are still pending).
     return result['resolved'] is None and ('Missing Harbor trial result' in result['detail']
                                            or 'CancelledError' in result['detail'])
+
+
+def regrade(source, policy='final-workspace', runs_dir=None, run_id=None):
+    """Score a finished SWE run under another policy into a new run directory; the source is never written."""
+    source = Path(source).resolve()
+    if policy != 'final-workspace':
+        raise ValueError('regrade supports only --policy final-workspace')
+    info = read_json(source / 'run.json')
+    snapshot = read_json(source / 'config.json')
+    if info.get('benchmark') != 'swebench' or info.get('oracle'):
+        raise ValueError('regrade applies to SWE-bench model runs only; Terminal-Bench is judged by its verifier')
+    if snapshot['suite']['swe_scoring'] == policy:
+        raise ValueError(f'{source.name} was already scored with {policy}')
+    manifest = read_json(source / 'manifest.json')
+    rows = read_json(source / 'results.json')
+    if not read_json(source / 'summary.json').get('complete'):
+        raise ValueError(f'{source.name} is incomplete; regrade needs a complete run')
+    run_id = run_id or f'{source.name}__{policy}'
+    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.-]*', run_id):
+        raise ValueError('run-id must be a safe directory name')
+    output = (Path(runs_dir) if runs_dir else source.parent).resolve() / run_id
+    output.mkdir(parents=True, exist_ok=False)
+    for name in ('manifest.json', 'config.json', 'dependencies.json', 'environment.uv.lock'):
+        if (source / name).exists():
+            (output / name).write_bytes((source / name).read_bytes())
+    comparison = read_json(source / 'comparison.json')
+    comparison['settings']['suite']['swe_scoring'] = policy
+    lock = ROOT / 'environments' / 'swebench' / 'uv.lock'
+    # Scoring reuses the original agent output; only the harness environment may have moved on.
+    comparison['regrade_environment_lock_sha256'] = hashlib.sha256(lock.read_bytes()).hexdigest() \
+        if lock.exists() else None
+    write_json(output / 'comparison.json', comparison)
+    write_json(output / 'run.json', dict(info, run_id=run_id, started_at_unix=time.time(),
+                                         regrade={'source': str(source), 'policy': policy}))
+    timeout = snapshot['suite']['swe_score_timeout']
+    scorer = SimpleNamespace(swe_score_timeout=timeout)
+    start, fatal, stopped = time.monotonic(), None, False
+    # Same selection as final-workspace in run_swe: exhausted budget with a non-empty final workspace.
+    pending = [r for r in rows if r['status'] == 'budget_exhausted' and r.get('scored_from') is None
+               and candidate_text(source, r['task_id']).strip()]
+    print(f'Artifacts: {output} ({len(pending)} candidate patches to grade)', flush=True)
+    done = set()
+    try:
+        for index, before in enumerate(pending):
+            task_id = before['task_id']
+            directory = output / 'tasks' / task_id
+            (directory / 'scoring').mkdir(parents=True)
+            (directory / 'dataset.json').write_bytes((source / 'tasks' / task_id / 'dataset.json').read_bytes())
+            process = score_swe(scorer, task_id, directory, {task_id: {
+                'instance_id': task_id, 'model_name_or_path': 'candidate',
+                'model_patch': candidate_text(source, task_id)}}, run_id)
+            result = candidate_result(before, task_id, directory / 'scoring')
+            if process['returncode'] or process['timed_out']:
+                result.update(status='environment_error', resolved=None,
+                              detail=before['detail'] + '; candidate: official harness '
+                              + ('timed out' if process['timed_out'] else 'process failed'))
+            result['scoring_paths'] = [str(p.relative_to(output)) for p in sorted((directory / 'scoring').rglob('*'))
+                                       if p.is_file() and p.name in ('report.json', 'run_instance.log', 'harness.log')]
+            rows[[r['task_id'] for r in rows].index(task_id)] = result
+            done.add(task_id)
+            progress(index + 1, len(pending), result)
+    except (Exception, KeyboardInterrupt) as exc:
+        stopped = isinstance(exc, KeyboardInterrupt)
+        fatal = 'Stopped by user' if stopped else redact(f'{type(exc).__name__}: {exc}')
+        todo = {r['task_id'] for r in pending} - done
+        for result in rows:
+            if result['task_id'] in todo:
+                result.update(status='stopped' if stopped else 'environment_error', resolved=None,
+                              detail=f"{fatal}; {result['detail']}")
+        write_json(output / 'error.json', {'error': fatal})
+    finally:
+        previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
+        try:
+            cleanup_containers(output, run_id)
+            scrub_tree(output)
+            # Trajectory and event paths in the rows stay relative to the source run.
+            summary = summarize(output, rows, time.monotonic() - start, len(manifest['tasks']), fatal)
+            summary.update(stopped=stopped, regraded_count=len(done), regrade_source=str(source))
+            write_json(output / 'summary.json', summary)
+        finally:
+            signal.signal(signal.SIGINT, previous)
+    return output, summary
+
+
+def candidate_text(run, task_id):
+    path = run / 'tasks' / task_id / 'agent' / 'candidate.patch'
+    return path.read_text() if path.is_file() else ''

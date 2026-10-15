@@ -3,11 +3,12 @@ import json
 from pathlib import Path
 import signal
 import sys
+import time
 from .config import Config, load_env, load_suite
 from .doctor import doctor
 from .io import redact, write_json
-from .results import compare
-from .runner import prepare, run_suite
+from .report import report
+from .runner import prepare, regrade, run_suite
 
 
 def interrupt(signum, frame):
@@ -39,21 +40,52 @@ def main(argv=None):
         command.add_argument('--run-id', help='Default <model>__<suite>__<benchmark>__<timestamp>')
         command.add_argument('--runs-dir', type=Path, default=Path('runs'))
         config_arguments(command)
-    comparison = commands.add_parser('compare')
+    summary = commands.add_parser('report', help='Compare runs per benchmark; the first model is the baseline')
+    summary.add_argument('runs', nargs='+', help='Model config names (latest complete run, needs --suite) or run directories')
+    summary.add_argument('--suite', help='Suite config name used to find runs by model')
+    summary.add_argument('--benchmark', action='append', choices=['swebench', 'tbv2'],
+                         help='Only this benchmark (repeatable; default: the suite benchmarks)')
+    summary.add_argument('--runs-dir', type=Path, default=Path('runs'))
+    summary.add_argument('--output', type=Path, help='Default <runs-dir>/reports/<timestamp>')
+    comparison = commands.add_parser('compare', help='Two-run report (alias of report)')
     comparison.add_argument('baseline', type=Path)
     comparison.add_argument('checkpoint', type=Path)
     comparison.add_argument('--output', type=Path)
+    again = commands.add_parser('regrade', help='Score a finished SWE run under another policy into a new run')
+    again.add_argument('run', type=Path, help='Run directory')
+    again.add_argument('--policy', default='final-workspace', choices=['final-workspace'])
+    again.add_argument('--run-id', help='Default <source run-id>__<policy>')
     args = parser.parse_args(argv)
     try:
         ignored = load_env()
         if ignored:
             print('Ignoring settings in .env (only credentials are read; use configs/ or --set): '
                   + ', '.join(ignored), file=sys.stderr)
-        if args.command == 'compare':
-            output = args.output or args.checkpoint.parent / f'compare-{args.baseline.name}-vs-{args.checkpoint.name}'
-            result = compare(args.baseline, args.checkpoint, output)
-            print(json.dumps(result, indent=2, ensure_ascii=False))
-            return 0 if result['complete'] else 2
+        if args.command in ('report', 'compare'):
+            if args.command == 'compare':
+                refs, suite, benchmarks = [args.baseline, args.checkpoint], None, ()
+                output = args.output or args.checkpoint.parent / f'compare-{args.baseline.name}-vs-{args.checkpoint.name}'
+            else:
+                refs, suite = args.runs, args.suite
+                benchmarks = args.benchmark or (load_suite(suite)[1]['benchmarks'] if suite else ())
+                output = args.output or args.runs_dir / 'reports' / time.strftime('%Y%m%d-%H%M%S')
+            result = report(refs, output, suite, benchmarks, getattr(args, 'runs_dir', Path('runs')),
+                            single=args.command == 'compare')
+            print(f'Report: {output / "report.html"}')
+            print(json.dumps([{'benchmark': b['benchmark'], 'differences': [d['key'] for d in b['differences']],
+                               'models': [{k: m[k] for k in ('label', 'complete', 'passed_count', 'scored_count',
+                                                             'task_count', 'success_rate', 'success_rate_delta',
+                                                             'gained', 'regressed')} for m in b['models']]}
+                              for b in result['benchmarks']], indent=2, ensure_ascii=False))
+            return 0 if all(m['complete'] for b in result['benchmarks'] for m in b['models']) else 2
+        if args.command == 'regrade':
+            signal.signal(signal.SIGTERM, interrupt)
+            signal.signal(signal.SIGINT, signal.default_int_handler)
+            output, summary = regrade(args.run, args.policy, run_id=args.run_id)
+            print(json.dumps({'output': str(output), **{k: summary[k] for k in (
+                'complete', 'stopped', 'success_count', 'task_count', 'success_rate', 'regraded_count')}},
+                indent=2, ensure_ascii=False))
+            return 130 if summary['stopped'] else 0 if summary['complete'] else 2
         if args.command == 'prepare':
             name, suite = load_suite(args.suite)
             output = []

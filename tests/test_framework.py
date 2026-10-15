@@ -10,7 +10,7 @@ from unittest.mock import patch
 from swe_eval.config import Config, digest
 from swe_eval.doctor import check_api
 from swe_eval.io import execute, read_json, scrub_tree, write_json
-from swe_eval.results import classify, compare, mini_usage, row, summarize, swe_result, tb_results
+from swe_eval.results import classify, mini_usage, row, summarize, swe_result, tb_results
 from swe_eval.runner import run, tb_config, validate_manifest
 
 
@@ -241,42 +241,6 @@ class FrameworkTests(unittest.TestCase):
         self.assertEqual(agent['kwargs']['parser_name'], 'json')
         self.assertFalse(agent['kwargs']['interleaved_thinking'])
         self.assertTrue(agent['kwargs']['llm_call_kwargs']['extra_body']['chat_template_kwargs']['enable_thinking'])
-
-    def make_run(self, name, resolved, complete=True):
-        folder = self.root / name
-        folder.mkdir()
-        write_json(folder / 'manifest.json', self.manifest())
-        write_json(folder / 'comparison.json', {'settings': {'temperature': .6}, 'versions': {'agent': '1'}})
-        record = row('a__a-1', 'success' if resolved else 'task_failed')
-        record['resolved'] = resolved
-        if not complete:
-            record.update(status='api_error', resolved=None)
-        summarize(folder, [record], 10, 1)
-        return folder
-
-    def test_compare_changes_and_deltas(self):
-        a, b = self.make_run('base', False), self.make_run('ckpt', True)
-        result = compare(a, b, self.root / 'comparison')
-        self.assertTrue(result['complete'])
-        self.assertEqual(result['success_count_delta'], 1)
-        self.assertEqual(read_json(self.root / 'comparison' / 'changes.json')[0]['resolved_delta'], 1)
-
-    def test_compare_refuses_different_configs_and_tasks(self):
-        a, b = self.make_run('base', False), self.make_run('ckpt', True)
-        write_json(b / 'comparison.json', {'settings': {'temperature': .9}})
-        with self.assertRaises(ValueError):
-            compare(a, b, self.root / 'comparison')
-        manifest = read_json(b / 'manifest.json')
-        manifest['tasks_sha256'] = 'different'
-        write_json(b / 'manifest.json', manifest)
-        with self.assertRaises(ValueError):
-            compare(a, b, self.root / 'comparison')
-
-    def test_compare_incomplete_has_no_rate_delta(self):
-        a, b = self.make_run('base', False), self.make_run('ckpt', False, complete=False)
-        result = compare(a, b, self.root / 'comparison')
-        self.assertFalse(result['complete'])
-        self.assertIsNone(result['success_rate_delta'])
 
     def test_run_without_dependencies_records_incomplete(self):
         with patch('swe_eval.runner.prepare', side_effect=RuntimeError('not installed')):

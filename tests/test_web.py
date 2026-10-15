@@ -72,6 +72,33 @@ class WebTests(unittest.TestCase):
         self.assertEqual(task['timeline'][0]['reasoning'], 'think')
         self.assertEqual(task['patch']['source'], 'final workspace (not submitted)')
 
+    def test_tb_stage_without_result_json_is_inferred_from_files(self):
+        trial = self.root / 'tb' / 'harbor' / 'job' / 'regex-log__abc'
+        trial.mkdir(parents=True)
+        stage = lambda: self.runs.progress(self.root / 'tb', 'tbv2', 'regex-log', 0)['stage']
+        with patch('swe_eval.web.task_directory', return_value=trial):
+            self.assertEqual(stage(), 'environment_setup')
+            write_json(trial / 'agent' / 'trajectory.json', {'steps': []})
+            self.assertEqual(stage(), 'agent')
+            write_json(trial / 'verifier' / 'test-stdout.txt', {})
+            self.assertEqual(stage(), 'verifier')
+
+    def test_finished_tb_trial_shows_verdict_before_job_ends(self):
+        folder = self.root / 'tb'
+        write_json(folder / 'manifest.json', {'tasks': [{'id': 'regex-log'}, {'id': 'raman-fitting'}]})
+        write_json(folder / 'run.json', {'benchmark': 'tbv2', 'pid': os.getpid()})
+        write_json(folder / 'results.json', [row('regex-log'), row('raman-fitting')])
+        write_json(folder / 'harbor' / 'job' / 'regex-log__abc' / 'result.json', {
+            'task_name': 'regex-log', 'started_at': '2026-01-01T00:00:00', 'finished_at': '2026-01-01T00:01:40',
+            'verifier_result': {'rewards': {'reward': 1.0}}, 'agent_result': {}})
+        (folder / 'harbor' / 'job' / 'raman-fitting__def').mkdir(parents=True)
+        with patch('swe_eval.web.alive', return_value=True):
+            tasks = {t['task_id']: t for t in self.runs.detail('tb')['tasks']}
+        self.assertEqual((tasks['regex-log']['status'], tasks['regex-log']['resolved'],
+                          tasks['regex-log']['elapsed_seconds']), ('success', True, 100))
+        self.assertEqual((tasks['raman-fitting']['status'], tasks['raman-fitting']['stage']),
+                         ('pending', 'environment_setup'))
+
     def test_run_without_summary_and_process_is_dead(self):
         with patch('swe_eval.web.alive', return_value=False):
             self.assertEqual(self.runs.detail('live')['state'], 'dead')

@@ -13,6 +13,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from .io import read_json, redact
 from .metrics import task_directory
+from .results import tb_results
 from .report import build, render
 
 SAFE = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]*')
@@ -137,7 +138,17 @@ class Runs:
             item = {k: result.get(k) for k in ROW_FIELDS}
             item['stage'] = None
             if running and result['status'] == 'pending':
-                item.update(self.progress(path, benchmark, task_id, now))
+                current = self.progress(path, benchmark, task_id, now)
+                if current['stage'] == 'finished' and benchmark == 'tbv2':
+                    # Harbor rows reach results.json only when the job ends; show the trial's own verdict now.
+                    directory = task_directory(path, benchmark, task_id)
+                    try:
+                        item.update({k: v for k, v in tb_results([{'id': task_id}], directory)[0].items()
+                                     if k in ROW_FIELDS})
+                    except (OSError, ValueError, KeyError, TypeError):
+                        item['stage'] = 'finished'
+                else:
+                    item.update(current)
             tasks.append(item)
         return {'run_id': run_id, 'info': info, 'state': state(path, info, summary), 'summary': summary,
                 'comparison': load(path / 'comparison.json'), 'error': load(path / 'error.json'), 'tasks': tasks}
@@ -157,7 +168,12 @@ class Runs:
             stage = next((name for key, name in (('verifier', 'verifier'), ('agent_execution', 'agent'),
                                                  ('agent_setup', 'agent_setup'),
                                                  ('environment_setup', 'environment_setup'))
-                          if (trial.get(key) or {}).get('started_at')), 'environment_setup')
+                          if (trial.get(key) or {}).get('started_at')), None)
+            if stage is None:
+                # Harbor writes result.json only when the trial ends; infer the phase from files on disk.
+                stage = 'verifier' if any((directory / 'verifier').glob('*')) else \
+                    'agent' if (directory / 'agent' / 'trajectory.json').exists() \
+                    or event_file(directory) else 'environment_setup'
             started = directory.stat().st_mtime
         stream = event_file(directory)
         counters = live(events(stream)) if stream else {}

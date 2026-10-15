@@ -8,7 +8,7 @@ from .config import Config, load_env, load_suite
 from .doctor import doctor
 from .io import redact, write_json
 from .report import report
-from .runner import prepare, regrade, run_suite
+from .runner import prepare, pull_images, regrade, run_suite
 from .web import serve
 
 
@@ -34,6 +34,10 @@ def main(argv=None):
     prep.add_argument('benchmark', nargs='?', choices=['swebench', 'tbv2'],
                       help='Only this benchmark (default: every benchmark in the suite)')
     prep.add_argument('--suite', default='smoke', help='Suite config name (configs/suites) or TOML path')
+    fetch = commands.add_parser('pull', help="Pull the Docker images a suite's tasks need (skips present ones)")
+    fetch.add_argument('benchmark', nargs='?', choices=['swebench', 'tbv2'],
+                       help='Only this benchmark (default: every benchmark in the suite)')
+    fetch.add_argument('--suite', default='smoke', help='Suite config name (configs/suites) or TOML path')
     for name in ('run', 'verify-scorer'):
         command = commands.add_parser(name, help='Run the suite in the foreground; Ctrl-C stops and cleans up')
         command.add_argument('benchmark', nargs='?', choices=['swebench', 'tbv2'],
@@ -103,6 +107,15 @@ def main(argv=None):
                 'complete', 'stopped', 'success_count', 'task_count', 'success_rate', 'regraded_count')}},
                 indent=2, ensure_ascii=False))
             return 130 if summary['stopped'] else 0 if summary['complete'] else 2
+        if args.command == 'pull':
+            name, suite = load_suite(args.suite)
+            output = []
+            for benchmark in [args.benchmark] if args.benchmark else suite['benchmarks']:
+                if benchmark not in suite['manifests']:
+                    raise ValueError(f'Suite {name} does not include {benchmark}')
+                output += [{'benchmark': benchmark, **r} for r in pull_images(benchmark, suite['manifests'][benchmark])]
+            print(json.dumps(output, indent=2))
+            return 0 if all(not r['status'].startswith('failed') for r in output) else 2
         if args.command == 'prepare':
             name, suite = load_suite(args.suite)
             output = []

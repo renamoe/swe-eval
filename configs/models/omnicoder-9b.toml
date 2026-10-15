@@ -1,0 +1,6 @@
+# Tesslate OmniCoder-9B (Qwen3.5-9B fine-tune), served on the same vLLM endpoint; one model at a time.
+# Sampling, template and context are inherited so the report compares like with like.
+extends = "qwen35-base"
+model = "OmniCoder-9B"
+checkpoint = "Tesslate/OmniCoder-9B@hf-mirror sha256:d4fca682"
+model_path = "/root/autodl-tmp/models/OmniCoder-9B"

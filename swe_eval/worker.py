@@ -89,6 +89,25 @@ def prepare(benchmark, spec_path, target):
                         'source': source, 'tasks': tasks, 'tasks_sha256': digest(tasks)})
 
 
+def images(benchmark, manifest_path, target):
+    """Resolve the Docker images a frozen manifest needs, using the upstream naming rules."""
+    tasks = read_json(manifest_path)['tasks']
+    if benchmark == 'swebench':
+        from minisweagent.run.extra.swebench import get_swebench_docker_image_name
+        result = {t['id']: get_swebench_docker_image_name(t['record']) for t in tasks}
+    else:
+        from harbor.models.task.config import TaskConfig
+        from harbor.models.trial.config import TaskConfig as TrialTaskConfig
+        from harbor.tasks.client import TaskClient
+        ids = [TrialTaskConfig.model_validate(t['task_config']).get_task_id() for t in tasks]
+        paths = asyncio.run(TaskClient().download_tasks(ids)).paths
+        result = {}
+        for task, path in zip(tasks, paths):
+            # None: the task builds from its Dockerfile, nothing to pull.
+            result[task['id']] = TaskConfig.model_validate_toml((Path(path) / 'task.toml').read_text()).environment.docker_image
+    write_json(target, result)
+
+
 def swe_config(config, target, run_label):
     import yaml
     from minisweagent.config import builtin_config_dir
@@ -170,6 +189,8 @@ def main():
         metadata(*args)
     elif mode == 'prepare':
         prepare(*args)
+    elif mode == 'images':
+        images(*args)
     elif mode == 'swe-config':
         swe_config(Config.from_snapshot(read_json(args[0])), args[1], args[2])
     elif mode == 'swe-agent':

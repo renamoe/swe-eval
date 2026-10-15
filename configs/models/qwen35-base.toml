@@ -8,7 +8,7 @@ server = "vllm"           # doctor checks /v1/models root and context, and /vers
 model_path = "/root/autodl-tmp/models/Qwen3.5-9B"
 vllm_version = "0.31.0"
 chat_template = "models/templates/qwen35-9b.jinja"   # fingerprint only; must match the server template
-context_length = 65536
+context_length = 131072
 reasoning = true          # doctor requires separate reasoning content
 
 [sampling]

@@ -160,6 +160,30 @@ def prepare(benchmark, spec):
     return validate_manifest(read_json(path), benchmark, spec)
 
 
+def pull_images(benchmark, spec, timeout=3600):
+    """Pull the Docker images a suite manifest needs, so download time stays out of task timings."""
+    path = ROOT / 'profiles' / f"{benchmark}-{spec['name']}.json"
+    prepare(benchmark, spec)
+    target = path.with_suffix('.images.json')
+    worker(benchmark, ['images', benchmark, path, target], path.with_suffix('.images.log'), timeout=1800)
+    rows = []
+    for task_id, image in read_json(target).items():
+        if image is None:
+            rows.append({'id': task_id, 'image': None, 'status': 'builds_from_dockerfile'})
+            continue
+        if docker_lines('image', 'inspect', '--format', '{{.Id}}', image):
+            rows.append({'id': task_id, 'image': image, 'status': 'present'})
+            continue
+        print(f'Pulling {image}', flush=True)
+        try:
+            process = subprocess.run(['docker', 'pull', '-q', image], capture_output=True, text=True, timeout=timeout)
+            status = 'pulled' if process.returncode == 0 else 'failed: ' + (process.stderr.strip().splitlines() or ['?'])[-1]
+        except subprocess.TimeoutExpired:
+            status = 'failed: timeout'
+        rows.append({'id': task_id, 'image': image, 'status': status})
+    return rows
+
+
 def tb_config(config, tasks, output, oracle):
     agent = {'name': 'oracle'} if oracle else {
         'name': 'terminus-2', 'model_name': 'openai/' + config.model,

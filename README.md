@@ -118,6 +118,12 @@ uv run --locked python -m swe_eval prepare --suite small-v1
 uv run --locked python -m swe_eval prepare swebench --suite full
 ```
 
+正式运行前预拉镜像，避免下载时间计入首题耗时和超时（已存在的跳过，从 Dockerfile 构建的 TB 任务不拉取）：
+
+```bash
+uv run --locked python -m swe_eval pull --suite small-v1
+```
+
 清单冻结在 `profiles/<benchmark>-<name>.json`，记录规格、数据集 revision（TB 为任务 Git commit）和实际 ID，后续实验复用。修改规格必须换新的 `name`，否则拒绝运行。删除后重新准备会重新解析上游版本，正式对比应保留同一份清单。该目录包含 SWE gold patch，禁止提供给 agent。
 
 仅验证评分器（不调用模型，仍需 `--model` 以记录配置）：

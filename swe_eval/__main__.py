@@ -1,12 +1,17 @@
 import argparse
 import json
 from pathlib import Path
+import signal
 import sys
 from .config import Config, load_env
 from .doctor import doctor
 from .io import redact, write_json
 from .results import compare
-from .runner import prepare, run
+from .runner import prepare, run_suite
+
+
+def interrupt(signum, frame):
+    raise KeyboardInterrupt
 
 
 def config_arguments(command, model_required=True):
@@ -27,9 +32,10 @@ def main(argv=None):
     prep.add_argument('benchmark', choices=['swebench', 'tbv2'])
     prep.add_argument('--profile', choices=['smoke', 'small'], default='smoke')
     for name in ('run', 'verify-scorer'):
-        command = commands.add_parser(name)
-        command.add_argument('benchmark', choices=['swebench', 'tbv2'])
-        command.add_argument('--run-id', required=True)
+        command = commands.add_parser(name, help='Run the suite in the foreground; Ctrl-C stops and cleans up')
+        command.add_argument('benchmark', nargs='?', choices=['swebench', 'tbv2'],
+                             help='Only this benchmark (default: every benchmark in the suite)')
+        command.add_argument('--run-id', help='Default <model>__<suite>__<benchmark>__<timestamp>')
         command.add_argument('--runs-dir', type=Path, default=Path('runs'))
         config_arguments(command)
     comparison = commands.add_parser('compare')
@@ -62,12 +68,20 @@ def main(argv=None):
             print(redact(json.dumps(result, indent=2, ensure_ascii=False)))
             return 0 if result['ok'] else 2
         config = Config.load(args.model, args.suite, args.set)
-        output, result = run(args.benchmark, args.run_id, config,
-                             args.runs_dir, oracle=args.command == 'verify-scorer')
-        print(json.dumps({'output': str(output), **result}, indent=2, ensure_ascii=False))
-        if args.command == 'verify-scorer' and result['success_count'] != result['task_count']:
+        # SIGTERM stops the run exactly like Ctrl-C: terminate, clean up, write the summary.
+        # Restore SIGINT too: shells start background jobs with SIGINT ignored.
+        signal.signal(signal.SIGTERM, interrupt)
+        signal.signal(signal.SIGINT, signal.default_int_handler)
+        results = run_suite(config, args.runs_dir, args.run_id, [args.benchmark] if args.benchmark else None,
+                            oracle=args.command == 'verify-scorer')
+        print(json.dumps([{k: r[k] for k in ('benchmark', 'output', 'complete', 'stopped', 'success_count',
+                                              'task_count', 'success_rate', 'status_counts', 'fatal_error')}
+                          for r in results], indent=2, ensure_ascii=False))
+        if any(r['stopped'] for r in results):
+            return 130
+        if args.command == 'verify-scorer' and any(r['success_count'] != r['task_count'] for r in results):
             return 2
-        return 0 if result['complete'] else 2
+        return 0 if all(r['complete'] for r in results) else 2
     except (ValueError, RuntimeError, OSError, KeyError) as exc:
         print(redact(f'{type(exc).__name__}: {exc}'), file=sys.stderr)
         return 2

@@ -3,6 +3,8 @@ import asyncio
 import importlib.metadata
 import json
 import os
+import signal
+import subprocess
 from pathlib import Path
 import sys
 import traceback
@@ -11,6 +13,34 @@ from .config import Config, digest
 from .io import read_json, write_json
 
 SWE_DATASET = 'princeton-nlp/SWE-bench_Verified'
+RUN_LABEL = 'swe_eval.run'
+
+
+class Stopped(BaseException):
+    """Raised by SIGTERM so finally blocks save artifacts before containers are removed."""
+
+
+def stop_on_sigterm():
+    def handler(signum, frame):
+        raise Stopped('Stopped by SIGTERM')
+    signal.signal(signal.SIGTERM, handler)
+
+
+def candidate_patch(container_id, output):
+    """Save the final workspace diff (same command as the native submit), bypassing telemetry."""
+    record = {'ok': False, 'bytes': 0, 'error': ''}
+    try:
+        process = subprocess.run(['docker', 'exec', '-w', '/testbed', container_id, 'bash', '-lc',
+                                  'git add -A && git diff --cached'],
+                                 capture_output=True, text=True, timeout=60, errors='replace')
+        if process.returncode:
+            record['error'] = process.stderr[-2000:] or f'git diff exited {process.returncode}'
+        else:
+            (output / 'candidate.patch').write_text(process.stdout)
+            record.update(ok=True, bytes=len(process.stdout.encode()))
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        record['error'] = f'{type(exc).__name__}: {exc}'
+    write_json(output / 'candidate.json', record)
 
 
 def metadata(benchmark, target):
@@ -57,11 +87,13 @@ def prepare(benchmark, profile, target):
                         'source': source, 'tasks': tasks, 'tasks_sha256': digest(tasks)})
 
 
-def swe_config(config, target):
+def swe_config(config, target, run_label):
     import yaml
     from minisweagent.config import builtin_config_dir
     upstream = yaml.safe_load((builtin_config_dir / 'extra' / 'swebench.yaml').read_text())
     upstream['agent'].update(step_limit=config.max_turns, cost_limit=0)
+    # Label agent containers so an interrupted run can remove exactly its own.
+    upstream['environment']['run_args'] = ['--rm', '--label', f'{RUN_LABEL}={run_label}']
     upstream['model'] = {'model_name': 'openai/' + config.model,
                          'model_class': 'litellm', 'cost_tracking': 'ignore_errors',
                          'model_kwargs': dict(api_base=config.base_url, timeout=config.api_timeout,
@@ -89,6 +121,7 @@ def swe_agent(config_path, task_path, output):
                   extra_info=extra, instance_id=task_id, print_path=False)
         temporary.replace(trajectory)
 
+    stop_on_sigterm()
     try:
         model = get_model(config=config['model'])
         env = get_sb_environment(config, task)
@@ -99,9 +132,14 @@ def swe_agent(config_path, task_path, output):
         status, submission = type(exc).__name__, ''
         extra = {'exception_str': str(exc), 'traceback': traceback.format_exc()}
     finally:
-        checkpoint()
+        # Finish saving within the runner's grace period; a second SIGTERM must not cut it short.
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        if agent:
+            checkpoint()
         update_preds_file(output / 'preds.json', task_id, config['model']['model_name'],
                           submission if status == 'Submitted' else '')
+        if env and env.container_id:
+            candidate_patch(env.container_id, output)
         if recorder:
             recorder.emit('agent_end', exit_status=status)
             inspect_containers(recorder, [env.container_id] if env.container_id else [])
@@ -115,6 +153,8 @@ def tb_run(config_path):
     from .telemetry import observe_harbor
 
     async def run():
+        # SIGTERM cancels the job so Harbor's own CancelledError path stops its environments.
+        asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, asyncio.current_task().cancel)
         observe_harbor()
         job = await Job.create(JobConfig.model_validate(read_json(config_path)))
         await job.run()
@@ -129,7 +169,7 @@ def main():
     elif mode == 'prepare':
         prepare(*args)
     elif mode == 'swe-config':
-        swe_config(Config.from_snapshot(read_json(args[0])), args[1])
+        swe_config(Config.from_snapshot(read_json(args[0])), args[1], args[2])
     elif mode == 'swe-agent':
         swe_agent(*args)
     elif mode == 'tb-run':

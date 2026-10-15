@@ -7,7 +7,7 @@
 | SWE-bench Verified | mini-SWE-agent，文本 bash 动作 | SWE-bench 官方 harness |
 | Terminal-Bench 2.0 | Harbor Terminus-2，文本 JSON 动作 | 任务自带 verifier |
 
-当前版本使用 CLI；Web 工作台和任务队列尚待实施，详见 [改进规划](docs/improvement-plan.md)。历史测试产物已清理，仓库不包含可引用的 benchmark 成绩。
+当前版本使用前台 CLI，一次评一个模型；多模型报告和 Web 浏览尚待实施，详见 [改进规划](docs/improvement-plan.md)。历史测试产物已清理，仓库不包含可引用的 benchmark 成绩。
 
 ## 安装
 
@@ -88,16 +88,18 @@ vLLM 服务端需启用适用的 reasoning parser；Qwen 使用 `--reasoning-par
 ```bash
 uv run --locked python -m swe_eval doctor --model qwen35-base --output runs/preflight/doctor.json
 
-# smoke：每套 1 题
-uv run --locked python -m swe_eval run swebench --model qwen35-base --suite smoke --run-id baseline-swe-smoke
-uv run --locked python -m swe_eval run tbv2 --model qwen35-base --suite smoke --run-id baseline-tb-smoke
+# 依次运行套件中的全部 benchmark：smoke 每套 1 题，small 每套 10 题
+uv run --locked python -m swe_eval run --model qwen35-base --suite smoke
 
-# small：每套 10 题
+# 只跑一个 benchmark，可指定 run-id
 uv run --locked python -m swe_eval run swebench --model qwen35-base --suite small --run-id baseline-swe-small
-uv run --locked python -m swe_eval run tbv2 --model qwen35-base --suite small --run-id baseline-tb-small
 ```
 
-`run-id` 必须唯一。当前并发为 1、每题 1 次尝试、Harbor 不重试 trial，自动上下文摘要关闭。预算由套件和显式 `--set` 决定；smoke 只验证执行链路。
+`run` 在前台执行，每个 benchmark 一个 run，默认 `run-id` 为 `<model>__<suite>__<benchmark>__<时间戳>`。终端每题输出一行结果和耗时；子进程日志（`agent.log`、`harness.log`、`harbor.log`）边运行边写入，可以 `tail -f`。当前并发为 1、每题 1 次尝试、Harbor 不重试 trial，自动上下文摘要关闭。预算由套件和显式 `--set` 决定；smoke 只验证执行链路。
+
+按 Ctrl-C 停止：当前子进程组先收到 SIGTERM，宽限期（SWE agent 60 秒、Harbor 120 秒）内保存轨迹和候选补丁，超时 SIGKILL；随后删除本 run 的容器（agent 容器的 `swe_eval.run` 标签、评分容器名、Harbor compose project），记录到 `cleanup.json`。未完成的题标记 `stopped`，汇总照常写出（`complete=false`、`stopped=true`），后续 benchmark 不再开始。清理期间再次 Ctrl-C 会被忽略。不支持恢复，重测时用新的 run 从头跑。本地停止只保证客户端断开，远端是否立即停止生成取决于服务端。
+
+SWE 评分策略由套件的 `swe_scoring` 决定。默认 `submitted-only` 只对正式提交评分；`final-workspace` 在预算耗尽时对最终工作区 diff（`candidate.patch`）评分，结果带 `scored_from=candidate`，终止原因仍为 `budget_exhausted`。两种策略的 run 不能直接比较。
 
 首次运行自动准备任务，也可单独执行：
 
@@ -111,8 +113,7 @@ uv run --locked python -m swe_eval prepare tbv2 --profile small
 仅验证评分器（不调用模型，仍需 `--model` 以记录配置）：
 
 ```bash
-uv run --locked python -m swe_eval verify-scorer swebench --model qwen35-base --run-id gold-swe
-uv run --locked python -m swe_eval verify-scorer tbv2 --model qwen35-base --run-id oracle-tb
+uv run --locked python -m swe_eval verify-scorer --model qwen35-base --suite smoke
 ```
 
 ## 结果与比较
@@ -125,8 +126,8 @@ uv run --locked python -m swe_eval verify-scorer tbv2 --model qwen35-base --run-
 | `dependencies.json`、`environment.uv.lock`、`comparison.json` | 依赖与比较条件 |
 | `doctor.json` | 模型和 Docker 预检 |
 | `results.json/csv`、`summary.json/csv` | 逐题结果及汇总 |
-| `failures.json`、`docker-oom-events.json` | 失败轨迹索引和本地 OOM 观察 |
-| `tasks/<id>/agent/`、`tasks/<id>/scoring/` | SWE 轨迹与官方评分 |
+| `failures.json`、`docker-oom-events.json`、`cleanup.json` | 失败轨迹索引、本地 OOM 观察和结束时清理的容器 |
+| `tasks/<id>/agent/`、`tasks/<id>/scoring/` | SWE 轨迹、`candidate.patch` 与官方评分 |
 | `harbor/job/` | TB 原生轨迹、verifier 和 reward |
 
 指标定义见 [metrics.md](docs/metrics.md)。缺失数据保留 `null`，不当作零；未完成实验不报告完整成功率，模型解题失败与 API/环境错误分开记录。
@@ -139,12 +140,12 @@ uv run --locked python -m swe_eval compare runs/baseline-swe-small runs/checkpoi
 
 比较核对任务、agent、提示词、环境、模板、采样和预算。不同评测条件会被拒绝，不能直接把不同预算的结果当作受控模型比较。
 
-目前尚无统一 Web 监控、持久队列或恢复入口。预算耗尽时 SWE 没有正式提交的修改会保存为空提交，外部强制停止也可能需要人工收尾；这些限制的改进方案在 [规划文档](docs/improvement-plan.md) 中。
+多模型报告与 Web 浏览尚待实施，见 [规划文档](docs/improvement-plan.md)。
 
 ## 开发与版本控制
 
 ```bash
-uv run --locked python -m unittest discover -s tests -v
+uv run --locked python -m unittest discover -s tests -t . -v
 ```
 
 代码、文档、模型示例、chat template 和三套依赖锁应纳入 Git。以下内容只留本地：

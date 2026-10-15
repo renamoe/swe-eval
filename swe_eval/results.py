@@ -7,12 +7,12 @@ from .config import digest
 from .io import read_json, redact, write_json
 from .metrics import METRIC_DEFAULTS, INFRA_TIMEOUT_STAGES, archive_index
 
-INFRA = {'api_error', 'environment_error', 'pending'}
+INFRA = {'api_error', 'environment_error', 'pending', 'stopped'}
 
 
 def row(task_id, status='pending', detail=''):
     return dict(task_id=task_id, status=status, resolved=None, elapsed_seconds=0,
-                input_tokens=None, output_tokens=None, detail=detail,
+                input_tokens=None, output_tokens=None, detail=detail, scored_from=None,
                 **{k: list(v) if isinstance(v, list) else v for k, v in METRIC_DEFAULTS.items()})
 
 
@@ -37,6 +37,18 @@ def mini_usage(trajectory):
     return {name: sum(u[key] for u in usage if u and isinstance(u.get(key), int))
             if any(u and isinstance(u.get(key), int) for u in usage) else None
             for name, key in [('input_tokens', 'prompt_tokens'), ('output_tokens', 'completion_tokens')]}
+
+
+def candidate_result(before, task_id, scoring_dir):
+    """final-workspace policy: keep the budget_exhausted termination, take the verdict from the harness."""
+    verdict = swe_result(task_id, None, scoring_dir, {'elapsed_seconds': 0, 'timed_out': False, 'returncode': 0},
+                         oracle=True)
+    result = dict(before, scored_from='candidate', resolved=verdict['resolved'])
+    if verdict['resolved'] is None:
+        result.update(status='environment_error', detail=before['detail'] + '; candidate: ' + verdict['detail'])
+    else:
+        result['detail'] = before['detail'] + '; graded final workspace'
+    return result
 
 
 def swe_result(task_id, agent_dir, scoring_dir, process, oracle=False):

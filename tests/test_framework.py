@@ -311,30 +311,69 @@ class FrameworkTests(unittest.TestCase):
         self.assertEqual(records[0]['status'], 'environment_error')
         self.assertFalse(summarize(self.root, records, 1, 1)['complete'])
 
-    def test_swe_orchestration_agent_to_harness(self):
+    def fake_swe(self, config, exit_status='Submitted', candidate='diff', resolved=False):
         from swe_eval.runner import run_swe
         output = self.root / 'run'
         output.mkdir()
         calls = []
-        def fake_execute(command, cwd, log, env=None, timeout=None):
+        def fake_execute(command, cwd, log, env=None, timeout=None, grace=30):
             calls.append(command)
             Path(log).parent.mkdir(parents=True, exist_ok=True)
             Path(log).write_text('ok')
             if 'swe-agent' in command:
                 target = Path(command[-1])
-                write_json(target / 'a__a-1' / 'a__a-1.traj.json', {'info': {'exit_status': 'Submitted'}})
-                write_json(target / 'preds.json', {'a__a-1': {'instance_id': 'a__a-1', 'model_patch': 'diff'}})
+                write_json(target / 'a__a-1' / 'a__a-1.traj.json', {'info': {'exit_status': exit_status}})
+                write_json(target / 'preds.json', {'a__a-1': {'instance_id': 'a__a-1',
+                           'model_patch': 'diff' if exit_status == 'Submitted' else ''}})
+                (target / 'candidate.patch').write_text(candidate)
             else:
-                write_json(Path(cwd) / 'logs' / 'report.json', {'a__a-1': {'resolved': False}})
+                predictions = read_json(command[command.index('--predictions_path') + 1])
+                if predictions['a__a-1']['model_patch']:
+                    write_json(Path(cwd) / 'logs' / 'report.json', {'a__a-1': {'resolved': resolved}})
+                else:  # Official harness reports empty predictions only in its aggregate.
+                    write_json(Path(cwd) / 'candidate.score.json', {'empty_patch_ids': ['a__a-1']})
             return {'elapsed_seconds': 1, 'returncode': 0, 'timed_out': False}
-        with patch('swe_eval.runner.worker'), patch('swe_eval.runner.environment_python', return_value=sys.executable), patch('swe_eval.runner.execute', side_effect=fake_execute):
-            records = run_swe(self.config, self.manifest()['tasks'], output, False)
+        tasks = self.manifest()['tasks']
+        rows = [row(t['id']) for t in tasks]
+        with patch('swe_eval.runner.worker'), patch('swe_eval.runner.environment_python', return_value=sys.executable), \
+                patch('swe_eval.runner.execute', side_effect=fake_execute), patch('sys.stdout', io.StringIO()):
+            run_swe(config, tasks, output, False, rows)
+        return output, rows, calls
+
+    def test_swe_orchestration_agent_to_harness(self):
+        output, records, calls = self.fake_swe(self.config)
         self.assertEqual(records[0]['status'], 'task_failed')
+        self.assertIsNone(records[0]['scored_from'])
         self.assertEqual(len(calls), 2)
         self.assertIn('swebench.harness.run_evaluation', calls[1])
+        # Harness run_id is the run directory name, which names its containers for cleanup.
+        self.assertEqual(calls[1][calls[1].index('--run_id') + 1], 'run')
         dataset_arg = calls[1][calls[1].index('--dataset_name') + 1]
         self.assertEqual(read_json(dataset_arg)[0]['patch'], 'gold')
         self.assertEqual(read_json(output / 'tasks' / 'a__a-1' / 'predictions.json')['a__a-1']['model_name_or_path'], 'candidate')
+
+    def test_submitted_only_ignores_candidate_patch(self):
+        _, records, calls = self.fake_swe(self.config, exit_status='LimitsExceeded', resolved=True)
+        self.assertEqual(records[0]['status'], 'budget_exhausted')
+        self.assertIs(records[0]['resolved'], False)
+        self.assertIsNone(records[0]['scored_from'])
+        # Native empty submission is still graded; the candidate patch is not.
+        predictions = read_json(self.root / 'run' / 'tasks' / 'a__a-1' / 'predictions.json')
+        self.assertEqual(predictions['a__a-1']['model_patch'], '')
+        self.assertEqual(len(calls), 2)
+
+    def test_final_workspace_grades_candidate_patch(self):
+        config = make_config(suite={'swe_scoring': 'final-workspace'})
+        output, records, calls = self.fake_swe(config, exit_status='LimitsExceeded', candidate='diff --git a', resolved=True)
+        self.assertEqual(records[0]['status'], 'budget_exhausted')
+        self.assertIs(records[0]['resolved'], True)
+        self.assertEqual(records[0]['scored_from'], 'candidate')
+        self.assertEqual(read_json(output / 'tasks' / 'a__a-1' / 'predictions.json')['a__a-1']['model_patch'], 'diff --git a')
+        # An empty final workspace is not graded as a candidate.
+        self.tmp.cleanup()
+        self.root.mkdir()
+        _, records, _ = self.fake_swe(config, exit_status='LimitsExceeded', candidate='', resolved=True)
+        self.assertIsNone(records[0]['scored_from'])
 
 
 if __name__ == '__main__':

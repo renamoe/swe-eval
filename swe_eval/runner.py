@@ -1,3 +1,4 @@
+from concurrent.futures import ThreadPoolExecutor
 import hashlib
 import os
 from pathlib import Path
@@ -10,7 +11,7 @@ from types import SimpleNamespace
 
 from .config import ROOT, base_env, digest
 from .doctor import doctor
-from .io import execute, read_json, redact, scrub_tree, write_json
+from .io import execute, kill_all, read_json, redact, resume, scrub_tree, write_json
 from .results import candidate_result, row, summarize, swe_result, tb_results
 from .manifests import SAFE_ID, spec_size
 from .metrics import docker_oom_events, enrich, task_directory
@@ -24,8 +25,7 @@ def environment_python(benchmark):
 
 
 RUN_LABEL = 'swe_eval.run'
-AGENT_GRACE = 60     # Lets the agent worker save trajectory and candidate.patch.
-HARBOR_GRACE = 120   # Lets Harbor stop its compose environments after cancellation.
+AGENT_GRACE = 60     # On agent timeout, lets the worker save trajectory and candidate.patch.
 
 
 def docker_lines(*args):
@@ -196,7 +196,7 @@ def tb_config(config, tasks, output, oracle):
                                   'input_cost_per_token': 0, 'output_cost_per_token': 0},
                    'llm_call_kwargs': dict(timeout=config.api_timeout, num_retries=0, **config.sampling())}}
     return {'job_name': 'job', 'jobs_dir': str(output / 'harbor'), 'n_attempts': 1,
-            'n_concurrent_trials': 1, 'retry': {'max_retries': 0},
+            'n_concurrent_trials': config.concurrency, 'retry': {'max_retries': 0},
             'environment': {'type': 'docker', 'delete': True}, 'agents': [agent],
             'tasks': [task['task_config'] for task in tasks]}
 
@@ -216,66 +216,99 @@ def score_swe(config, task_id, directory, predictions, label):
 
 
 def run_swe(config, tasks, output, oracle, rows):
-    """Fill rows in place, one task at a time, so an interrupt keeps finished results."""
+    """Fill rows in place, up to config.concurrency tasks at once, so an interrupt keeps finished results.
+
+    An interrupt SIGKILLs every running task; those tasks are not scored and stay pending."""
     run_id = output.name
     if not oracle:
         worker('swebench', ['swe-config', output / 'config.json', output / 'agent-config.json', run_id],
                output / 'config.log')
-    for index, task in enumerate(tasks):
-        task_id = task['id']
-        print(f'[{index + 1}/{len(tasks)}] {task_id}: running', flush=True)
-        directory = output / 'tasks' / task_id
-        directory.mkdir(parents=True)
-        write_json(directory / 'task.json', task['record'])
-        write_json(directory / 'dataset.json', [task['record']])
-        agent_dir = directory / 'agent'
-        agent_dir.mkdir()
-        scoring = directory / 'scoring'
-        scoring.mkdir()
-        started = time.monotonic()
-        if oracle:
-            write_json(agent_dir / 'preds.json', {task_id: {'instance_id': task_id,
-                       'model_name_or_path': 'gold', 'model_patch': task['record']['patch']}})
-            process = {'returncode': 0, 'timed_out': False, 'elapsed_seconds': 0}
-        else:
-            process = execute([environment_python('swebench'), '-m', 'swe_eval.worker', 'swe-agent',
-                               str(output / 'agent-config.json'), str(directory / 'task.json'), str(agent_dir)],
-                              ROOT, agent_dir / 'agent.log', config.child_env(), config.swe_agent_timeout,
-                              grace=AGENT_GRACE)
-        write_json(directory / 'agent-process.json', process)
-        before = swe_result(task_id, agent_dir, scoring, process, oracle)
-        # Harness verdict needed: formal submission, oracle, or the empty-submission budget case.
-        budget_submission = (before['status'] == 'budget_exhausted' and not process['timed_out']
-                             and (agent_dir / 'preds.json').exists())
-        candidate = agent_dir / 'candidate.patch'
-        grade_candidate = (not oracle and config.swe_scoring == 'final-workspace'
-                           and before['status'] == 'budget_exhausted'
-                           and candidate.exists() and candidate.read_text().strip())
-        if grade_candidate:
-            score_process = score_swe(config, task_id, directory, {task_id: {
-                'instance_id': task_id, 'model_name_or_path': 'candidate',
-                'model_patch': candidate.read_text()}}, run_id)
-            result = candidate_result(before, task_id, scoring)
-        elif not oracle and before['detail'] != 'Missing or duplicate official harness report' and not budget_submission:
-            result, score_process = before, None
-        else:
-            predictions = read_json(agent_dir / 'preds.json')
-            # Safe, stable harness label. Actual model/checkpoint is recorded in config.json.
-            predictions[task_id]['model_name_or_path'] = 'gold' if oracle else 'candidate'
-            score_process = score_swe(config, task_id, directory, predictions, run_id)
-            result = swe_result(task_id, agent_dir, scoring, process, oracle)
-            if budget_submission and result['resolved'] is None and not score_process['returncode'] \
-                    and not score_process['timed_out']:
-                result.update(status='environment_error', detail='Missing official harness outcome for exhausted budget')
-        if score_process and (score_process['returncode'] or score_process['timed_out']):
-            result.update(status='environment_error', resolved=None,
-                          detail='Official harness timed out; see harness.log' if score_process['timed_out']
-                          else 'Official harness process failed; see harness.log')
-        result['elapsed_seconds'] = round(time.monotonic() - started, 3)
-        rows[index] = result
-        write_json(output / 'results.json', rows)
-        progress(index + 1, len(tasks), result)
+    lock, stopping, finished = threading.Lock(), threading.Event(), [0]
+
+    def one(index, task):
+        if stopping.is_set():
+            return
+        with lock:
+            print(f"start {task['id']}", flush=True)
+        result = swe_task(config, task, output, oracle, run_id, stopping)
+        if stopping.is_set():
+            return
+        with lock:
+            rows[index] = result
+            finished[0] += 1
+            write_json(output / 'results.json', rows)
+            progress(finished[0], len(tasks), result)
+
+    pool = ThreadPoolExecutor(config.concurrency, thread_name_prefix='swe-task')
+    futures = [pool.submit(one, index, task) for index, task in enumerate(tasks)]
+    try:
+        for future in futures:
+            future.result()
+    except BaseException:
+        # Ctrl-C/SIGTERM (or a task raising): drop queued tasks, kill running ones, wait for the threads.
+        stopping.set()
+        pool.shutdown(wait=False, cancel_futures=True)
+        kill_all()
+        pool.shutdown(wait=True)
+        resume()
+        raise
+    pool.shutdown()
     return rows
+
+
+def swe_task(config, task, output, oracle, run_id, stopping):
+    """Agent then official harness for one task; returns its result row."""
+    task_id = task['id']
+    directory = output / 'tasks' / task_id
+    directory.mkdir(parents=True)
+    write_json(directory / 'task.json', task['record'])
+    write_json(directory / 'dataset.json', [task['record']])
+    agent_dir = directory / 'agent'
+    agent_dir.mkdir()
+    scoring = directory / 'scoring'
+    scoring.mkdir()
+    started = time.monotonic()
+    if oracle:
+        write_json(agent_dir / 'preds.json', {task_id: {'instance_id': task_id,
+                   'model_name_or_path': 'gold', 'model_patch': task['record']['patch']}})
+        process = {'returncode': 0, 'timed_out': False, 'elapsed_seconds': 0}
+    else:
+        process = execute([environment_python('swebench'), '-m', 'swe_eval.worker', 'swe-agent',
+                           str(output / 'agent-config.json'), str(directory / 'task.json'), str(agent_dir)],
+                          ROOT, agent_dir / 'agent.log', config.child_env(), config.swe_agent_timeout,
+                          grace=AGENT_GRACE)
+    write_json(directory / 'agent-process.json', process)
+    if stopping.is_set():
+        return None
+    before = swe_result(task_id, agent_dir, scoring, process, oracle)
+    # Harness verdict needed: formal submission, oracle, or the empty-submission budget case.
+    budget_submission = (before['status'] == 'budget_exhausted' and not process['timed_out']
+                         and (agent_dir / 'preds.json').exists())
+    candidate = agent_dir / 'candidate.patch'
+    grade_candidate = (not oracle and config.swe_scoring == 'final-workspace'
+                       and before['status'] == 'budget_exhausted'
+                       and candidate.exists() and candidate.read_text().strip())
+    if grade_candidate:
+        score_process = score_swe(config, task_id, directory, {task_id: {
+            'instance_id': task_id, 'model_name_or_path': 'candidate',
+            'model_patch': candidate.read_text()}}, run_id)
+        result = candidate_result(before, task_id, scoring)
+    elif not oracle and before['detail'] != 'Missing or duplicate official harness report' and not budget_submission:
+        result, score_process = before, None
+    else:
+        predictions = read_json(agent_dir / 'preds.json')
+        # Safe, stable harness label. Actual model/checkpoint is recorded in config.json.
+        predictions[task_id]['model_name_or_path'] = 'gold' if oracle else 'candidate'
+        score_process = score_swe(config, task_id, directory, predictions, run_id)
+        result = swe_result(task_id, agent_dir, scoring, process, oracle)
+        if budget_submission and result['resolved'] is None and not score_process['returncode']                 and not score_process['timed_out']:
+            result.update(status='environment_error', detail='Missing official harness outcome for exhausted budget')
+    if score_process and (score_process['returncode'] or score_process['timed_out']):
+        result.update(status='environment_error', resolved=None,
+                      detail='Official harness timed out; see harness.log' if score_process['timed_out']
+                      else 'Official harness process failed; see harness.log')
+    result['elapsed_seconds'] = round(time.monotonic() - started, 3)
+    return result
 
 
 def run_suite(config, runs_dir=Path('runs'), run_id=None, benchmarks=None, oracle=False):
@@ -326,7 +359,7 @@ def run(benchmark, run_id, config, runs_dir=Path('runs'), oracle=False):
         metadata = read_json(output / 'dependencies.json')
         write_json(output / 'comparison.json', {
             'benchmark': benchmark, 'tasks_sha256': manifest['tasks_sha256'],
-            'settings': config.comparison_settings(), 'oracle': oracle, 'concurrency': 1, 'attempts': 1,
+            'settings': config.comparison_settings(), 'oracle': oracle, 'concurrency': config.concurrency, 'attempts': 1,
             'versions': metadata['versions'], 'agent_sources_sha256': metadata['agent_sources_sha256'],
             'installed_distributions_sha256': digest(metadata['all_distributions']),
             'python': metadata['python'],
@@ -348,8 +381,7 @@ def run(benchmark, run_id, config, runs_dir=Path('runs'), oracle=False):
             try:
                 process = execute([environment_python(benchmark), '-m', 'swe_eval.worker', 'tb-run',
                                    str(output / 'harbor-config.json')], output, output / 'harbor.log',
-                                  config.child_env(api=not oracle), timeout=None,  # Dataset-native phase timeouts.
-                                  grace=HARBOR_GRACE)
+                                  config.child_env(api=not oracle), timeout=None)  # Dataset-native phase timeouts.
             finally:
                 watcher.done.set()
             watcher.scan()
@@ -362,7 +394,7 @@ def run(benchmark, run_id, config, runs_dir=Path('runs'), oracle=False):
         stopped = isinstance(exc, KeyboardInterrupt)
         fatal = 'Stopped by user' if stopped else redact(f'{type(exc).__name__}: {exc}')
         if stopped:
-            print('Stopping: terminated the current task; cleaning up containers', flush=True)
+            print('Stopping: killed running tasks; cleaning up containers', flush=True)
         if benchmark == 'tbv2' and (output / 'harbor').exists() and 'tasks' in locals():
             try:
                 rows = tb_results(tasks, output / 'harbor')

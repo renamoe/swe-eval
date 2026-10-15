@@ -75,18 +75,18 @@ chat_template_kwargs = { enable_thinking = true }
 
 ## 4. 运行模型
 
-使用场景：一次只评一个模型，现调用现测，单线程前台执行；中断后只清理，不恢复。因此不做后台 supervisor、队列、stop/resume 命令和 `status.json`。
+使用场景：一次只评一个模型，现调用现测，前台执行（题目级并发见 [concurrency-plan.md](concurrency-plan.md)）；中断后只清理，不恢复。因此不做后台 supervisor、队列、stop/resume 命令和 `status.json`。
 
 ### 4.1 执行
 
 - `run --model X --suite Y` 在当前终端依次执行套件中的 benchmark，每个 benchmark 一个 run，`run-id` 默认 `<model>__<suite>__<benchmark>__<时间戳>`，单 benchmark 时可用 `--run-id` 指定。
-- SWE 逐题执行；Terminal-Bench 保持一个 Harbor job，中断后从已有 trial 读结果。
+- SWE 按套件 `concurrency`（默认 1，最大 4）同时跑多题；Terminal-Bench 保持一个 Harbor job（`n_concurrent_trials` 取同一值），中断后从已有 trial 读结果。
 - 进度直接打印到终端，每题一行（题号、结果、耗时）。
 - 子进程日志边运行边写入 run 目录，按行脱敏，可 `tail -f` 查看。
 
 ### 4.2 中断与清理
 
-- Ctrl-C 或 SIGTERM：向当前子进程组发 SIGTERM，宽限期后 SIGKILL，不开始后续题和后续 benchmark。
+- Ctrl-C 或 SIGTERM：丢弃排队题，对所有在跑子进程组直接 SIGKILL，在跑题不评分；不开始后续 benchmark。agent 墙钟超时仍为 SIGTERM 加 60 秒宽限。
 - 清理本 run 的容器：SWE agent 容器带 `swe_eval.run=<run-id>` 标签，SWE 评分容器名含本 run 的 harness run_id，Harbor 按 trial 的 compose project 前缀；统一 `docker rm -f`。
 - 未完成的题标记 `stopped`，已有轨迹保留；汇总照常写出，`complete=false`。
 - 需要重测时用新的 run-id 从头跑。本地中断只保证客户端断开，远端是否立即中止生成取决于服务端。

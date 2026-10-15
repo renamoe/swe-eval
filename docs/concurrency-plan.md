@@ -1,6 +1,6 @@
 # 题目级并发方案
 
-状态：待评审。日期：2026-10-15。修订 [improvement-plan.md](improvement-plan.md) 第 4 节"单线程前台"。
+状态：已实现，待真实验收。日期：2026-10-15。修订 [improvement-plan.md](improvement-plan.md) 第 4 节"单线程前台"。
 
 ## 1. 目标与边界
 

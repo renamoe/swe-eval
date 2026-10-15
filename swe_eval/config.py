@@ -30,7 +30,7 @@ SUITE_FIELDS = {
     'benchmarks': (list, None), 'manifests': (dict, None), 'max_tokens': (int, None),
     'max_turns': (int, None), 'swe_agent_timeout': (int, None), 'swe_score_timeout': (int, None),
     'api_timeout': (int, None), 'swe_scoring': (str, 'submitted-only'),
-    'record_terminal_session': (bool, False),
+    'record_terminal_session': (bool, False), 'concurrency': (int, 1),
 }
 # extra_body is merged into the request body; it must not replace core request fields.
 RESERVED_BODY = {'model', 'messages', 'stream', 'tools', 'max_tokens', *SAMPLING_FIELDS}
@@ -180,6 +180,8 @@ def check_suite(data):
             raise ValueError(f'{name} must be positive')
     if suite['swe_scoring'] not in ('submitted-only', 'final-workspace'):
         raise ValueError('swe_scoring must be submitted-only or final-workspace')
+    if not 1 <= suite['concurrency'] <= 4:
+        raise ValueError('concurrency must be between 1 and 4')
     return suite
 
 
@@ -261,6 +263,7 @@ class Config:
     extra_body: dict = None
     swe_scoring: str = 'submitted-only'
     record_terminal_session: bool = False
+    concurrency: int = 1
     overrides: dict = None
 
     @classmethod
@@ -307,7 +310,9 @@ class Config:
         snapshot = self.snapshot()
         model = {k: v for k, v in snapshot['model'].items()
                  if k not in ('model', 'base_url', 'checkpoint', 'api_key_env', 'model_path')}
-        return {'model': model, 'suite': snapshot['suite'], 'chat_template_sha256': self.chat_template_sha256}
+        # Concurrency is recorded once, at the top level of comparison.json.
+        suite = {k: v for k, v in snapshot['suite'].items() if k != 'concurrency'}
+        return {'model': model, 'suite': suite, 'chat_template_sha256': self.chat_template_sha256}
 
     def sampling(self):
         parameters = dict(self.sampling_params, max_tokens=self.max_tokens)

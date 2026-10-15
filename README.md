@@ -95,9 +95,9 @@ uv run --locked python -m swe_eval run --model qwen35-base --suite smoke
 uv run --locked python -m swe_eval run swebench --model qwen35-base --suite small-v1 --run-id baseline-swe-small
 ```
 
-`run` 在前台执行，每个 benchmark 一个 run，默认 `run-id` 为 `<model>__<suite>__<benchmark>__<时间戳>`。终端每题输出一行结果和耗时；子进程日志（`agent.log`、`harness.log`、`harbor.log`）边运行边写入，可以 `tail -f`。当前并发为 1、每题 1 次尝试、Harbor 不重试 trial，自动上下文摘要关闭。预算由套件和显式 `--set` 决定；smoke 只验证执行链路。
+`run` 在前台执行，每个 benchmark 一个 run，默认 `run-id` 为 `<model>__<suite>__<benchmark>__<时间戳>`。终端每题输出一行结果和耗时；子进程日志（`agent.log`、`harness.log`、`harbor.log`）边运行边写入，可以 `tail -f`。默认并发为 1（套件字段 `concurrency`，可 `--set concurrency=2`，最大 4；并发度记入 `comparison.json`，耗时类指标不跨并发度比较）、每题 1 次尝试、Harbor 不重试 trial，自动上下文摘要关闭。预算由套件和显式 `--set` 决定；smoke 只验证执行链路。
 
-按 Ctrl-C 停止：当前子进程组先收到 SIGTERM，宽限期（SWE agent 60 秒、Harbor 120 秒）内保存轨迹和候选补丁，超时 SIGKILL；随后删除本 run 的容器（agent 容器的 `swe_eval.run` 标签、评分容器名、Harbor compose project），记录到 `cleanup.json`。未完成的题标记 `stopped`，汇总照常写出（`complete=false`、`stopped=true`），后续 benchmark 不再开始。清理期间再次 Ctrl-C 会被忽略。不支持恢复，重测时用新的 run 从头跑。本地停止只保证客户端断开，远端是否立即停止生成取决于服务端。
+按 Ctrl-C 停止：排队题不再开始，所有在跑的子进程组直接 SIGKILL，在跑题不评分、不保存候选补丁；随后删除本 run 的容器（agent 容器的 `swe_eval.run` 标签、评分容器名、Harbor compose project），记录到 `cleanup.json`。未完成的题标记 `stopped`，汇总照常写出（`complete=false`、`stopped=true`），后续 benchmark 不再开始。清理期间再次 Ctrl-C 会被忽略。不支持恢复，重测时用新的 run 从头跑。本地停止只保证客户端断开，远端是否立即停止生成取决于服务端。
 
 SWE 评分策略由套件的 `swe_scoring` 决定。默认 `submitted-only` 只对正式提交评分；`final-workspace` 在预算耗尽时对最终工作区 diff（`candidate.patch`）评分，结果带 `scored_from=candidate`，终止原因仍为 `budget_exhausted`。两种策略的 run 不能直接比较。
 

@@ -1,0 +1,16 @@
+# SWE-bench Verified 60-task subset, per-repo counts proportional to the full split (disk-bounded stand-in for full).
+# Budgets match full; changing the manifest spec needs a new manifest name.
+benchmarks = ["swebench"]
+max_tokens = 8192
+max_turns = 100
+swe_agent_timeout = 3600
+swe_score_timeout = 1800
+api_timeout = 300
+swe_scoring = "submitted-only"
+record_terminal_session = false
+
+[manifests.swebench]
+name = "sample-60"
+sample = 60
+seed = 20261016
+stratify = "repo-proportional"

@@ -26,6 +26,23 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual(len({GROUPS[i] for i in more}), 12)
         self.assertEqual(len(more), 15)
 
+    def test_proportional_sample_follows_group_shares(self):
+        spec = {'name': 's', 'sample': 30, 'seed': 20261015, 'stratify': 'repo-proportional'}
+        chosen = select(GROUPS, spec, GROUPS)
+        self.assertEqual(len(chosen), 30)
+        self.assertEqual(chosen, select(list(reversed(GROUPS)), spec, GROUPS))
+        counts = {}
+        for task_id in chosen:
+            counts[GROUPS[task_id]] = counts.get(GROUPS[task_id], 0) + 1
+        sizes = {}
+        for group in GROUPS.values():
+            sizes[group] = sizes.get(group, 0) + 1
+        # Largest remainder: every group gets floor or ceil of its exact share.
+        for group, size in sizes.items():
+            share = 30 * size / len(GROUPS)
+            self.assertIn(counts.get(group, 0), {int(share), int(share) + 1}, group)
+        self.assertNotEqual(chosen, select(GROUPS, dict(spec, seed=8), GROUPS))
+
     def test_explicit_and_full(self):
         self.assertEqual(select(GROUPS, {'name': 'x', 'ids': ['repo1__repo1-0', 'repo0__repo0-0']}),
                          ['repo0__repo0-0', 'repo1__repo1-0'])
@@ -48,6 +65,8 @@ class ManifestTests(unittest.TestCase):
                 check_spec('swebench', spec)
         with self.assertRaisesRegex(ValueError, 'stratify'):
             check_spec('tbv2', {'name': 'x', 'sample': 2, 'seed': 1, 'stratify': 'repo'})
+        with self.assertRaisesRegex(ValueError, 'stratify'):
+            check_spec('swebench', {'name': 'x', 'sample': 2, 'seed': 1, 'stratify': 'org'})
         self.assertEqual(spec_size({'name': 'x', 'ids': ['a', 'b']}), 2)
         self.assertIsNone(spec_size({'name': 'x', 'all': True}))
 

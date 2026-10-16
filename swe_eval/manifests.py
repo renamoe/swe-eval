@@ -1,4 +1,5 @@
-"""Suite task-list specs: explicit IDs, a seeded sample (SWE may stratify by repo), or the full split.
+"""Suite task-list specs: explicit IDs, a seeded sample (SWE may stratify by repo, round-robin or
+proportional), or the full split.
 
 Stdlib only; imported by the main CLI and by both isolated worker environments.
 """
@@ -8,6 +9,8 @@ import re
 NAME = re.compile(r'[A-Za-z0-9][A-Za-z0-9_.-]*')
 SAFE_ID = re.compile(r'[A-Za-z0-9_.-]+')
 SPEC_FIELDS = {'name', 'ids', 'sample', 'seed', 'stratify', 'all'}
+# repo: round-robin, every repo once before any twice. repo-proportional: per-repo counts follow dataset shares.
+STRATIFY = {'repo', 'repo-proportional'}
 
 
 def is_int(value):
@@ -38,8 +41,8 @@ def check_spec(benchmark, spec):
             raise ValueError(f'{label}.sample needs a positive count and an integer seed')
     elif 'seed' in spec:
         raise ValueError(f'{label}.seed only applies to sample')
-    if 'stratify' in spec and (spec['stratify'] != 'repo' or benchmark != 'swebench' or 'sample' not in spec):
-        raise ValueError(f'{label}.stratify supports only "repo" for a swebench sample')
+    if 'stratify' in spec and (spec['stratify'] not in STRATIFY or benchmark != 'swebench' or 'sample' not in spec):
+        raise ValueError(f'{label}.stratify supports only "repo" or "repo-proportional" for a swebench sample')
     if 'all' in spec and spec['all'] is not True:
         raise ValueError(f'{label}.all must be true')
     return dict(spec)
@@ -76,6 +79,13 @@ def select(ids, spec, groups=None):
     # Round-robin over groups in seeded order: every group gets one task before any gets two.
     queues = [sorted(members, key=lambda i: rank(seed, i))
               for _, members in sorted(buckets.items(), key=lambda item: rank(seed, item[0]))]
+    if spec['stratify'] == 'repo-proportional':
+        # Largest-remainder allocation of n by group share; equal remainders go to groups in seeded order.
+        quotas = [n * len(q) // len(ids) for q in queues]
+        spare = sorted(range(len(queues)), key=lambda g: -(n * len(queues[g]) % len(ids)))
+        for g in spare[:n - sum(quotas)]:
+            quotas[g] += 1
+        return sorted(task_id for q, k in zip(queues, quotas) for task_id in q[:k])
     chosen, depth = [], 0
     while len(chosen) < n:
         chosen.extend(q[depth] for q in queues if depth < len(q))

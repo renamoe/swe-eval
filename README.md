@@ -109,7 +109,7 @@ SWE 评分策略由套件的 `swe_scoring` 决定。默认 `submitted-only` 只�
 | `small-v1` | 12 题，12 个仓库各 1 题，固定 seed | 10 题，固定 seed |
 | `full` | 完整 test split（500） | 完整数据集 |
 
-套件的 `[manifests.<benchmark>]` 用三种方式之一声明清单：`ids = [...]`；`sample = n` 加 `seed`（SWE 可加 `stratify = "repo"`，先保证每个仓库一题再轮转）；`all = true`。抽样按 `sha256(seed:id)` 排序，与 Python 版本无关，同 seed 得到同一组 ID。
+套件的 `[manifests.<benchmark>]` 用三种方式之一声明清单：`ids = [...]`；`sample = n` 加 `seed`（SWE 可加 `stratify = "repo"`，先保证每个仓库一题再轮转；或 `stratify = "repo-proportional"`，各仓库题数按其在数据集中的占比以最大余数法分配）；`all = true`。抽样按 `sha256(seed:id)` 排序，与 Python 版本无关，同 seed 得到同一组 ID。
 
 首次运行自动准备，也可单独执行：
 

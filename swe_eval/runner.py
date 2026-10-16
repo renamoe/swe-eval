@@ -1,17 +1,19 @@
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 import hashlib
 import os
 from pathlib import Path
 import re
+import shutil
 import signal
 import subprocess
 import threading
 import time
 from types import SimpleNamespace
 
-from .config import ROOT, base_env, digest
+from .config import ROOT, Config, base_env, digest
 from .doctor import doctor
-from .io import execute, kill_all, read_json, redact, resume, scrub_tree, write_json
+from .io import alive, execute, kill_all, read_json, redact, resume, scrub_tree, write_json
 from .results import candidate_result, row, summarize, swe_result, tb_results
 from .manifests import SAFE_ID, spec_size
 from .metrics import docker_oom_events, enrich, task_directory
@@ -215,15 +217,16 @@ def score_swe(config, task_id, directory, predictions, label):
     return process
 
 
-def run_swe(config, tasks, output, oracle, rows):
+def run_swe(config, tasks, output, oracle, rows, skip=()):
     """Fill rows in place, up to config.concurrency tasks at once, so an interrupt keeps finished results.
 
-    An interrupt SIGKILLs every running task; those tasks are not scored and stay pending."""
+    Task indexes in skip already have a result (resume). An interrupt SIGKILLs every running task;
+    those tasks are not scored and stay pending."""
     run_id = output.name
     if not oracle:
         worker('swebench', ['swe-config', output / 'config.json', output / 'agent-config.json', run_id],
                output / 'config.log')
-    lock, stopping, finished = threading.Lock(), threading.Event(), [0]
+    lock, stopping, finished = threading.Lock(), threading.Event(), [len(skip)]
 
     def one(index, task):
         if stopping.is_set():
@@ -240,7 +243,7 @@ def run_swe(config, tasks, output, oracle, rows):
             progress(finished[0], len(tasks), result)
 
     pool = ThreadPoolExecutor(config.concurrency, thread_name_prefix='swe-task')
-    futures = [pool.submit(one, index, task) for index, task in enumerate(tasks)]
+    futures = [pool.submit(one, index, task) for index, task in enumerate(tasks) if index not in skip]
     try:
         for future in futures:
             future.result()
@@ -364,7 +367,7 @@ def run(benchmark, run_id, config, runs_dir=Path('runs'), oracle=False):
             'installed_distributions_sha256': digest(metadata['all_distributions']),
             'python': metadata['python'],
             'environment_lock_sha256': hashlib.sha256(lock.read_bytes()).hexdigest(),
-            'runner_sha256': digest({p.name: p.read_text() for p in sorted((ROOT / 'swe_eval').glob('*.py'))})})
+            'runner_sha256': runner_sha256()})
         preflight = doctor(config, api=not oracle)
         write_json(output / 'doctor.json', preflight)
         if not preflight['ok']:
@@ -391,41 +394,139 @@ def run(benchmark, run_id, config, runs_dir=Path('runs'), oracle=False):
             if process['returncode']:
                 raise RuntimeError('Harbor process failed; see harbor.log')
     except (Exception, KeyboardInterrupt) as exc:
-        stopped = isinstance(exc, KeyboardInterrupt)
-        fatal = 'Stopped by user' if stopped else redact(f'{type(exc).__name__}: {exc}')
-        if stopped:
-            print('Stopping: killed running tasks; cleaning up containers', flush=True)
-        if benchmark == 'tbv2' and (output / 'harbor').exists() and 'tasks' in locals():
-            try:
-                rows = tb_results(tasks, output / 'harbor')
-                write_json(output / 'results.json', rows)
-            except (ValueError, KeyError, TypeError):
-                pass  # Preserve the original error if a trial artifact is incomplete.
-        if (output / 'results.json').exists():
-            saved = {r['task_id']: r for r in read_json(output / 'results.json')}
-            rows = [saved[r['task_id']] if saved.get(r['task_id'], {}).get('status', 'pending') != 'pending'
-                    else r for r in rows]
-        for result in rows:
-            if result['status'] == 'pending' or stopped and interrupted(result):
-                result.update(status='stopped' if stopped else 'environment_error', resolved=None,
-                              detail=fatal if result['status'] == 'pending' else f"{fatal}; {result['detail']}")
-        write_json(output / 'error.json', {'error': fatal})
+        rows, fatal, stopped = settle(benchmark, output, rows, exc, locals().get('tasks'))
     finally:
-        # A second Ctrl-C must not abort cleanup and leave containers behind.
-        previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
-        try:
-            cleanup_containers(output, run_id)
-            oom = docker_oom_events(output, started_at) if rows else None
-            for result in rows:
-                enrich(result, task_directory(output, benchmark, result['task_id']), output, oom,
-                       budget=config.context_length - config.max_tokens)
-            scrub_tree(output)
-            summary = summarize(output, rows, time.monotonic() - start, expected, fatal)
-            summary['stopped'] = stopped
-            write_json(output / 'summary.json', summary)
-        finally:
-            signal.signal(signal.SIGINT, previous)
+        summary = conclude(benchmark, output, rows, config, started_at, start, 0.0, expected, fatal, stopped)
     return output, summary
+
+
+def runner_sha256():
+    return digest({p.name: p.read_text() for p in sorted((ROOT / 'swe_eval').glob('*.py'))})
+
+
+def resume_run(source, retry_errors=False, concurrency=None):
+    """Continue a stopped or crashed SWE run in place: keep finished tasks, rerun the rest from scratch.
+
+    Kept: tasks with a model outcome, plus api/environment errors unless retry_errors. Rerun: pending
+    and stopped tasks (their partial artifacts are deleted). Agent sources, installed distributions and
+    the environment lock must match the run; a changed runner is only recorded."""
+    output = Path(source).resolve()
+    info = read_json(output / 'run.json')
+    if info.get('benchmark') != 'swebench' or info.get('oracle'):
+        raise ValueError('resume supports SWE-bench model runs only')
+    if alive(info.get('pid')) and info.get('pid') != os.getpid():
+        raise ValueError(f"{output.name} is still running (pid {info['pid']})")
+    if info.get('regrade'):
+        raise ValueError('resume does not apply to regrade runs')
+    config = Config.from_snapshot(read_json(output / 'config.json'))
+    if concurrency is not None:
+        if not 1 <= concurrency <= 4:
+            raise ValueError('concurrency must be between 1 and 4')
+        config = replace(config, concurrency=concurrency)
+    manifest = read_json(output / 'manifest.json')
+    if manifest['tasks_sha256'] != digest(manifest['tasks']):
+        raise ValueError('Manifest content hash mismatch')
+    tasks = manifest['tasks']
+    comparison = read_json(output / 'comparison.json')
+    lock = ROOT / 'environments' / 'swebench' / 'uv.lock'
+    if hashlib.sha256(lock.read_bytes()).hexdigest() != comparison['environment_lock_sha256']:
+        raise ValueError('environments/swebench/uv.lock changed since the run started; start a new run')
+    check = output / 'dependencies.resume.json'
+    worker('swebench', ['metadata', 'swebench', check], output / 'metadata.log')
+    metadata = read_json(check)
+    check.unlink()
+    for key, now in (('agent_sources_sha256', metadata['agent_sources_sha256']),
+                     ('installed_distributions_sha256', digest(metadata['all_distributions']))):
+        if now != comparison[key]:
+            raise ValueError(f'{key} changed since the run started; start a new run')
+    # Preflight before touching the run, so a dead endpoint leaves it resumable as it was.
+    preflight = doctor(config)
+    if not preflight['ok']:
+        write_json(output / 'doctor.resume.json', preflight)
+        raise RuntimeError('Preflight failed; see doctor.resume.json')
+    write_json(output / 'doctor.json', preflight)
+    saved = {r['task_id']: r for r in read_json(output / 'results.json')}
+    rerun = {'pending', 'stopped'} | ({'api_error', 'environment_error'} if retry_errors else set())
+    rows, skip = [], set()
+    for index, task in enumerate(tasks):
+        previous = saved.get(task['id'])
+        if previous and previous['status'] not in rerun:
+            rows.append(previous)
+            skip.add(index)
+        else:
+            shutil.rmtree(output / 'tasks' / task['id'], ignore_errors=True)
+            rows.append(row(task['id']))
+    todo = [t['id'] for i, t in enumerate(tasks) if i not in skip]
+    if not todo:
+        raise ValueError(f'{output.name} has no unfinished tasks to resume')
+    old = read_json(output / 'summary.json') if (output / 'summary.json').exists() else {}
+    prior_elapsed = old.get('elapsed_seconds')  # None when the earlier segment crashed before its summary.
+    for name in ('summary.json', 'error.json'):
+        (output / name).unlink(missing_ok=True)
+    segment = {'started_at_unix': time.time(), 'pid': os.getpid(), 'rerun': todo,
+               'concurrency': config.concurrency, 'runner_sha256': runner_sha256()}
+    write_json(output / 'run.json', dict(info, pid=os.getpid(), resumes=[*info.get('resumes', []), segment]))
+    # Timing and the runner may differ between segments: reports list this as a non-controlled difference.
+    write_json(output / 'comparison.json', dict(comparison, resumes=[
+        *comparison.get('resumes', []), {k: segment[k] for k in ('concurrency', 'runner_sha256')}]))
+    write_json(output / 'results.json', rows)
+    print(f'Resuming {output} ({len(todo)} of {len(tasks)} tasks, concurrency {config.concurrency})', flush=True)
+    cleanup_containers(output, output.name)  # Leftovers from a crashed segment.
+    start, fatal, stopped = time.monotonic(), None, False
+    try:
+        run_swe(config, tasks, output, False, rows, skip)
+    except (Exception, KeyboardInterrupt) as exc:
+        rows, fatal, stopped = settle('swebench', output, rows, exc, tasks)
+    finally:
+        summary = conclude('swebench', output, rows, config, info['started_at_unix'], start, prior_elapsed,
+                           len(tasks), fatal, stopped)
+    return output, summary
+
+
+def settle(benchmark, output, rows, exc, tasks=None):
+    """After an error or interrupt: keep saved results and mark unfinished rows. Returns rows, fatal, stopped."""
+    stopped = isinstance(exc, KeyboardInterrupt)
+    fatal = 'Stopped by user' if stopped else redact(f'{type(exc).__name__}: {exc}')
+    if stopped:
+        print('Stopping: killed running tasks; cleaning up containers', flush=True)
+    if benchmark == 'tbv2' and (output / 'harbor').exists() and tasks is not None:
+        try:
+            rows = tb_results(tasks, output / 'harbor')
+            write_json(output / 'results.json', rows)
+        except (ValueError, KeyError, TypeError):
+            pass  # Preserve the original error if a trial artifact is incomplete.
+    if (output / 'results.json').exists():
+        saved = {r['task_id']: r for r in read_json(output / 'results.json')}
+        rows = [saved[r['task_id']] if saved.get(r['task_id'], {}).get('status', 'pending') != 'pending'
+                else r for r in rows]
+    for result in rows:
+        if result['status'] == 'pending' or stopped and interrupted(result):
+            result.update(status='stopped' if stopped else 'environment_error', resolved=None,
+                          detail=fatal if result['status'] == 'pending' else f"{fatal}; {result['detail']}")
+    write_json(output / 'error.json', {'error': fatal})
+    return rows, fatal, stopped
+
+
+def conclude(benchmark, output, rows, config, started_at, start, prior_elapsed, expected, fatal, stopped):
+    """Clean up containers, enrich rows and write summary.json; prior_elapsed None means an earlier segment is unknown."""
+    # A second Ctrl-C must not abort cleanup and leave containers behind.
+    previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        cleanup_containers(output, output.name)
+        oom = docker_oom_events(output, started_at) if rows else None
+        for result in rows:
+            enrich(result, task_directory(output, benchmark, result['task_id']), output, oom,
+                   budget=config.context_length - config.max_tokens)
+        scrub_tree(output)
+        elapsed = time.monotonic() - start
+        summary = summarize(output, rows, elapsed + (prior_elapsed or 0), expected, fatal)
+        if prior_elapsed is None:
+            summary['elapsed_seconds'] = None
+        summary['stopped'] = stopped
+        write_json(output / 'summary.json', summary)
+    finally:
+        signal.signal(signal.SIGINT, previous)
+    return summary
 
 
 def interrupted(result):

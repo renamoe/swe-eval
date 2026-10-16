@@ -81,6 +81,16 @@ def _kill(process):
         pass
 
 
+def alive(pid):
+    """Whether pid is a live swe_eval process (a run that has not exited)."""
+    if not pid:
+        return False
+    try:
+        return b'swe_eval' in Path(f'/proc/{pid}/cmdline').read_bytes()
+    except OSError:
+        return False
+
+
 def kill_all():
     """Interrupt: SIGKILL every live child group at once; children started afterwards die immediately."""
     with _children_lock:

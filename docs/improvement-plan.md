@@ -75,7 +75,7 @@ chat_template_kwargs = { enable_thinking = true }
 
 ## 4. 运行模型
 
-使用场景：一次只评一个模型，现调用现测，前台执行（题目级并发见 [concurrency-plan.md](concurrency-plan.md)）；中断后只清理，不恢复。因此不做后台 supervisor、队列、stop/resume 命令和 `status.json`。
+使用场景：一次只评一个模型，现调用现测，前台执行（题目级并发见 [concurrency-plan.md](concurrency-plan.md)）；中断后清理；SWE run 可用 `resume` 按题原地续跑（已完成题保留，未完成题从头重跑），Terminal-Bench 不续跑。不做后台 supervisor、队列、stop 命令和 `status.json`。
 
 ### 4.1 执行
 

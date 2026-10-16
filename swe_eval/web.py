@@ -11,7 +11,7 @@ import re
 import time
 from urllib.parse import parse_qs, urlsplit
 
-from .io import read_json, redact
+from .io import alive, read_json, redact
 from .metrics import task_directory
 from .results import tb_results
 from .report import build, render
@@ -30,15 +30,6 @@ def load(path, default=None):
         return read_json(path)
     except (OSError, ValueError):
         return default
-
-
-def alive(pid):
-    if not pid:
-        return False
-    try:
-        return b'swe_eval' in Path(f'/proc/{pid}/cmdline').read_bytes()
-    except OSError:
-        return False
 
 
 def state(path, info, summary):

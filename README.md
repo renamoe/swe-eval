@@ -97,7 +97,18 @@ uv run --locked python -m swe_eval run swebench --model qwen35-base --suite smal
 
 `run` 在前台执行，每个 benchmark 一个 run，默认 `run-id` 为 `<model>__<suite>__<benchmark>__<时间戳>`。终端每题输出一行结果和耗时；子进程日志（`agent.log`、`harness.log`、`harbor.log`）边运行边写入，可以 `tail -f`。默认并发为 1（套件字段 `concurrency`，可 `--set concurrency=2`，最大 4；并发度记入 `comparison.json`，耗时类指标不跨并发度比较）、每题 1 次尝试、Harbor 不重试 trial，自动上下文摘要关闭。预算由套件和显式 `--set` 决定；smoke 只验证执行链路。
 
-按 Ctrl-C 停止：排队题不再开始，所有在跑的子进程组直接 SIGKILL，在跑题不评分、不保存候选补丁；随后删除本 run 的容器（agent 容器的 `swe_eval.run` 标签、评分容器名、Harbor compose project），记录到 `cleanup.json`。未完成的题标记 `stopped`，汇总照常写出（`complete=false`、`stopped=true`），后续 benchmark 不再开始。清理期间再次 Ctrl-C 会被忽略。不支持恢复，重测时用新的 run 从头跑。本地停止只保证客户端断开，远端是否立即停止生成取决于服务端。
+按 Ctrl-C 停止：排队题不再开始，所有在跑的子进程组直接 SIGKILL，在跑题不评分、不保存候选补丁；随后删除本 run 的容器（agent 容器的 `swe_eval.run` 标签、评分容器名、Harbor compose project），记录到 `cleanup.json`。未完成的题标记 `stopped`，汇总照常写出（`complete=false`、`stopped=true`），后续 benchmark 不再开始。清理期间再次 Ctrl-C 会被忽略。本地停止只保证客户端断开，远端是否立即停止生成取决于服务端。
+
+SWE run 被 Ctrl-C 停止或进程崩溃（如 WSL 重启）后，可以按题续跑：
+
+```bash
+uv run --locked python -m swe_eval resume runs/<run-id> [--concurrency 2] [--retry-errors]
+```
+
+- 原地续跑：已有结果的题保留；`pending`、`stopped` 的题删除残留产物后从头重跑。`api_error`、`environment_error` 默认保留，加 `--retry-errors` 才重跑。
+- 续跑前检查 agent 源码、已安装依赖和 `uv.lock` 与原 run 一致，不一致拒绝；预检失败时 run 不变，可稍后再试。运行器代码变化只记录不阻止。
+- 每段续跑记入 `run.json` 和 `comparison.json` 的 `resumes`（并发度、运行器指纹），报告会把它列为非受控差异。总耗时为各段之和；崩溃的一段没有记录耗时时 `elapsed_seconds` 为 `null`。
+- Terminal-Bench 暂不支持续跑，重测时用新的 run 从头跑。
 
 SWE 评分策略由套件的 `swe_scoring` 决定。默认 `submitted-only` 只对正式提交评分；`final-workspace` 在预算耗尽时对最终工作区 diff（`candidate.patch`）评分，结果带 `scored_from=candidate`，终止原因仍为 `budget_exhausted`。两种策略的 run 不能直接比较。
 

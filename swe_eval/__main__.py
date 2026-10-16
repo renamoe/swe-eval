@@ -8,7 +8,7 @@ from .config import Config, load_env, load_suite
 from .doctor import doctor
 from .io import redact, write_json
 from .report import report
-from .runner import prepare, pull_images, regrade, run_suite
+from .runner import prepare, pull_images, regrade, resume_run, run_suite
 from .web import serve
 
 
@@ -60,6 +60,10 @@ def main(argv=None):
     again.add_argument('run', type=Path, help='Run directory')
     again.add_argument('--policy', default='final-workspace', choices=['final-workspace'])
     again.add_argument('--run-id', help='Default <source run-id>__<policy>')
+    proceed = commands.add_parser('resume', help='Continue a stopped or crashed SWE run in place; finished tasks are kept')
+    proceed.add_argument('run', type=Path, help='Run directory')
+    proceed.add_argument('--retry-errors', action='store_true', help='Also rerun api_error and environment_error tasks')
+    proceed.add_argument('--concurrency', type=int, help='Default: the concurrency the run started with')
     view = commands.add_parser('serve', help='Read-only local web view of runs and reports')
     view.add_argument('--runs-dir', type=Path, default=Path('runs'))
     view.add_argument('--host', default='127.0.0.1', help='No authentication: keep it local, use SSH forwarding')
@@ -105,6 +109,14 @@ def main(argv=None):
             output, summary = regrade(args.run, args.policy, run_id=args.run_id)
             print(json.dumps({'output': str(output), **{k: summary[k] for k in (
                 'complete', 'stopped', 'success_count', 'task_count', 'success_rate', 'regraded_count')}},
+                indent=2, ensure_ascii=False))
+            return 130 if summary['stopped'] else 0 if summary['complete'] else 2
+        if args.command == 'resume':
+            signal.signal(signal.SIGTERM, interrupt)
+            signal.signal(signal.SIGINT, signal.default_int_handler)
+            output, summary = resume_run(args.run, args.retry_errors, args.concurrency)
+            print(json.dumps({'output': str(output), **{k: summary[k] for k in (
+                'complete', 'stopped', 'success_count', 'task_count', 'success_rate', 'status_counts', 'fatal_error')}},
                 indent=2, ensure_ascii=False))
             return 130 if summary['stopped'] else 0 if summary['complete'] else 2
         if args.command == 'pull':
